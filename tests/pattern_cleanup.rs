@@ -26,6 +26,9 @@ impl InstanceMarker for P3 {
 #[tokio::test]
 async fn cleanup_after_drop_exact_and_pattern() {
     // given a fresh bus
+    #[cfg(feature = "bus-metrics")]
+    let bus = Bus::new(8, None);
+    #[cfg(not(feature = "bus-metrics"))]
     let bus = Bus::new(8);
     let h = bus.handle();
     let from = ServiceAddr::of_instance::<Producer, P1>();
@@ -58,6 +61,9 @@ async fn cleanup_after_drop_exact_and_pattern() {
 
 #[tokio::test]
 async fn cleanup_on_repeated_sub_unsub_pattern() {
+    #[cfg(feature = "bus-metrics")]
+    let bus = Bus::new(4, None);
+    #[cfg(not(feature = "bus-metrics"))]
     let bus = Bus::new(4);
     let h = bus.handle();
     let from = ServiceAddr::of_instance::<Producer, P2>();
@@ -73,6 +79,9 @@ async fn cleanup_on_repeated_sub_unsub_pattern() {
 
 #[tokio::test]
 async fn publish_with_no_subscribers_is_noop() {
+    #[cfg(feature = "bus-metrics")]
+    let bus = Bus::new(2, None);
+    #[cfg(not(feature = "bus-metrics"))]
     let bus = Bus::new(2);
     let h = bus.handle();
     let from = ServiceAddr::of_instance::<Producer, P3>();

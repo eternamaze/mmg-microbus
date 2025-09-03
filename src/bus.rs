@@ -120,14 +120,18 @@ impl<T> Subscription<T> {
     }
 }
 
+type TopicMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
+type ServiceTopics = HashMap<ServiceAddr, TopicMap>;
+type PatternHandlers = Vec<Box<dyn Any + Send + Sync>>;
+
 #[derive(Clone)]
 pub struct BusHandle {
     inner: Arc<BusInner>,
 }
 
 struct BusInner {
-    topics: RwLock<HashMap<ServiceAddr, HashMap<TypeId, Box<dyn Any + Send + Sync>>>>,
-    patterns: RwLock<HashMap<TypeId, Vec<Box<dyn Any + Send + Sync>>>>,
+    topics: RwLock<ServiceTopics>,
+    patterns: RwLock<HashMap<TypeId, PatternHandlers>>,
     default_capacity: usize,
     #[cfg(feature = "bus-metrics")]
     metrics: Option<Arc<BusMetrics>>,
@@ -322,6 +326,14 @@ impl BusHandle {
                             delivered += 1;
                         }
                     }
+                    #[cfg(feature = "bus-metrics")]
+                    if let Some(m) = &self.inner.metrics {
+                        m.delivered.fetch_add(delivered, Ordering::Relaxed);
+                        if let Some(s) = start {
+                            m.record_latency(s.elapsed());
+                        }
+                        m.dec_inflight();
+                    }
                     return;
                 }
             }
@@ -371,7 +383,7 @@ impl BusHandle {
         if let Some(m) = &self.inner.metrics {
             m.delivered.fetch_add(delivered, Ordering::Relaxed);
             if let Some(s) = start {
-                m.record_latency(s.elapsed().unwrap_or_default());
+                m.record_latency(s.elapsed());
             }
             m.dec_inflight();
         }
