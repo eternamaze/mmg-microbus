@@ -120,14 +120,18 @@ impl<T> Subscription<T> {
     }
 }
 
+type TopicMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
+type ServiceTopics = HashMap<ServiceAddr, TopicMap>;
+type PatternHandlers = Vec<Box<dyn Any + Send + Sync>>;
+
 #[derive(Clone)]
 pub struct BusHandle {
     inner: Arc<BusInner>,
 }
 
 struct BusInner {
-    topics: RwLock<HashMap<ServiceAddr, HashMap<TypeId, Box<dyn Any + Send + Sync>>>>,
-    patterns: RwLock<HashMap<TypeId, Vec<Box<dyn Any + Send + Sync>>>>,
+    topics: RwLock<ServiceTopics>,
+    patterns: RwLock<HashMap<TypeId, PatternHandlers>>,
     default_capacity: usize,
     #[cfg(feature = "bus-metrics")]
     metrics: Option<Arc<BusMetrics>>,

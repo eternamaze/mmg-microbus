@@ -281,24 +281,26 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
             for seg in &tp.path.segments {
                 if seg.ident == "Arc" {
                     if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
-                        if let Some(syn::GenericArgument::Type(syn::Type::Path(inner))) = ab.args.first() {
-                                // Arc<...>
-                                if let Some(last) = inner.path.segments.last() {
-                                    if last.ident == "Envelope" {
-                                        if let syn::PathArguments::AngleBracketed(env_ab) =
-                                            &last.arguments
+                        if let Some(syn::GenericArgument::Type(syn::Type::Path(inner))) =
+                            ab.args.first()
+                        {
+                            // Arc<...>
+                            if let Some(last) = inner.path.segments.last() {
+                                if last.ident == "Envelope" {
+                                    if let syn::PathArguments::AngleBracketed(env_ab) =
+                                        &last.arguments
+                                    {
+                                        if let Some(syn::GenericArgument::Type(t)) =
+                                            env_ab.args.first()
                                         {
-                                            if let Some(syn::GenericArgument::Type(t)) =
-                                                env_ab.args.first()
-                                            {
-                                                return Some((true, false, t.clone()));
-                                            }
+                                            return Some((true, false, t.clone()));
                                         }
-                                    } else {
-                                        // Arc<T>
-                                        return Some((false, false, Type::Path(inner.clone())));
                                     }
+                                } else {
+                                    // Arc<T>
+                                    return Some((false, false, Type::Path(inner.clone())));
                                 }
+                            }
                         }
                     }
                 }

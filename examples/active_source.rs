@@ -22,7 +22,7 @@ impl mmg_microbus::component::Component for Feeder {
         loop {
             tokio::select! {
                 _ = intv.tick() => { n += 1; ctx.publish(Tick(n)).await; }
-                changed = ctx.shutdown.changed() => { if changed.is_ok() { break; } else { break; } }
+                _ = ctx.shutdown.changed() => { break; }
             }
         }
         Ok(())
