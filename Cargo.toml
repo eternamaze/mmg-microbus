@@ -1,0 +1,39 @@
+[package]
+name = "mmg-microbus"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Typed microservice message bus and app runtime with precise routing, wildcard, envelopes, and declarative auto-wiring."
+repository = "https://github.com/eternamaze/mmg-microbus"
+keywords = ["async", "tokio", "message-bus", "microservice", "pubsub"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+async-trait = "0.1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+inventory = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
+smallvec = "1"
+microbus-macros = { path = "./microbus-macros" }
+
+[lib]
+name = "mmg_microbus"
+path = "src/lib.rs"
+
+[features]
+default = []
+bus-metrics = []
+
+[dev-dependencies]
+trybuild = "1"
+tempfile = "3"
+prettyplease = "0.2"
+
+
+[workspace]
+members = ["microbus-macros"]

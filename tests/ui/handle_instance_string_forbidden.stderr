@@ -1,0 +1,5 @@
+error: #[handle]: `instance` expects a marker type (impl InstanceMarker)
+ --> tests/ui/handle_instance_string_forbidden.rs:8:53
+  |
+8 |     #[mmg_microbus::handle(Tick, from=Src, instance="x")] // ERROR: string instance forbidden
+  |                                                     ^^^
