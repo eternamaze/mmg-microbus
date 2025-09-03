@@ -57,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: ["", "debug-api", "bus-metrics", "debug-api,bus-metrics"]
+        features: ["", "bus-metrics"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

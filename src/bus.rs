@@ -326,6 +326,14 @@ impl BusHandle {
                             delivered += 1;
                         }
                     }
+                    #[cfg(feature = "bus-metrics")]
+                    if let Some(m) = &self.inner.metrics {
+                        m.delivered.fetch_add(delivered, Ordering::Relaxed);
+                        if let Some(s) = start {
+                            m.record_latency(s.elapsed());
+                        }
+                        m.dec_inflight();
+                    }
                     return;
                 }
             }
@@ -375,7 +383,7 @@ impl BusHandle {
         if let Some(m) = &self.inner.metrics {
             m.delivered.fetch_add(delivered, Ordering::Relaxed);
             if let Some(s) = start {
-                m.record_latency(s.elapsed().unwrap_or_default());
+                m.record_latency(s.elapsed());
             }
             m.dec_inflight();
         }
