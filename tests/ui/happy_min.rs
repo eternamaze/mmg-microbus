@@ -8,7 +8,7 @@ struct C { id: mmg_microbus::bus::ComponentId }
 
 #[mmg_microbus::handles]
 impl C {
-    async fn on_tick(&mut self, _env: std::sync::Arc<Envelope<Tick>>) -> Result<()> { Ok(()) }
+    async fn on_tick(&mut self, _tick: &Tick) -> Result<()> { Ok(()) }
 }
 
 fn main() {}

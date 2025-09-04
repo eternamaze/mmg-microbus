@@ -104,18 +104,22 @@ pub fn configure(args: TokenStream, input: TokenStream) -> TokenStream {
                 fn apply<'a>(
                     &'a mut self,
                     ctx: mmg_microbus::component::ConfigContext,
-                    v: serde_json::Value,
+                    v: std::sync::Arc<dyn std::any::Any + Send + Sync>,
                 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
                     Box::pin(async move {
-                        let cfg: #ty = serde_json::from_value(v)?;
-                        <Self as mmg_microbus::component::Configure<#ty>>::on_config(self, &ctx, cfg).await
+                        if let Ok(v) = v.downcast::<#ty>() {
+                            <Self as mmg_microbus::component::Configure<#ty>>::on_config(self, &ctx, (*v).clone()).await
+                        } else {
+                            // 若类型不匹配，静默忽略（允许同一聚合配置里不存在该类型）
+                            Ok(())
+                        }
                     })
                 }
             }
             fn __invoke<'a>(
                 comp: &'a mut dyn mmg_microbus::component::Component,
                 ctx: mmg_microbus::component::ConfigContext,
-                v: serde_json::Value,
+                v: std::sync::Arc<dyn std::any::Any + Send + Sync>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
                 if let Some(c) = comp.as_any_mut().downcast_mut::<#self_ty>() {
                     mmg_microbus::component::ConfigApplyDyn::apply(c, ctx, v)
@@ -129,17 +133,14 @@ pub fn configure(args: TokenStream, input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-// --- 方法即订阅（强类型） ---
+// --- 方法即订阅（强类型，&T-only） ---
 // 用法：
 //   #[mmg_microbus::handles]
 //   impl MyComp {
 //       #[mmg_microbus::handle(Tick)]
-//       async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, env: std::sync::Arc<mmg_microbus::bus::Envelope<Tick>>) -> anyhow::Result<()> {
-//           // ... 业务逻辑 ...
-//           Ok(())
-//       }
+//       async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> { Ok(()) }
 //   }
-// 要求：结构体已使用 #[component] 注册工厂；无需手写 Component 实现，宏会自动生成 run()，为每个 #[handle(T)] 建立强类型订阅并调度到对应方法。
+// 说明：仅支持消息参数为 `&T`，可选注入 `&ComponentContext`。不再支持 Envelope 或 ScopedBus 注入。
 
 #[proc_macro_attribute]
 pub fn handle(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -230,16 +231,12 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
     // 收集处理方法规范
     struct MethodSpec {
         ident: syn::Ident,
-        // 订阅类型：true 表示 Envelope<T>，false 表示 T
-        sub_is_envelope: bool,
-        param_is_ref: bool,
         msg_ty: Type,
         wants_ctx: bool,
-        wants_scoped_bus: bool,
         pattern_tokens: proc_macro2::TokenStream,
     }
 
-    fn is_ctx_type(ty: &syn::Type) -> (bool, bool) {
+    fn is_ctx_type(ty: &syn::Type) -> bool {
         if let syn::Type::Reference(r) = ty {
             if let syn::Type::Path(tp) = &*r.elem {
                 let last = tp
@@ -248,62 +245,16 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                     .last()
                     .map(|s| s.ident.to_string())
                     .unwrap_or_default();
-                if last == "ComponentContext" {
-                    return (true, false);
-                }
-                if last == "ScopedBus" {
-                    return (false, true);
-                }
+                if last == "ComponentContext" { return true; }
             }
         }
-        (false, false)
+        false
     }
 
-    fn parse_msg_arg(ty: &syn::Type) -> Option<(bool /*is_env*/, bool /*by_ref*/, Type)> {
-        // 支持 &Envelope<T> / &T / Arc<Envelope<T>> / Arc<T>
+    fn parse_msg_arg_ref(ty: &syn::Type) -> Option<Type> {
         if let syn::Type::Reference(r) = ty {
             if let syn::Type::Path(tp) = &*r.elem {
-                if let Some(last) = tp.path.segments.last() {
-                    if last.ident == "Envelope" {
-                        if let syn::PathArguments::AngleBracketed(env_ab) = &last.arguments {
-                            if let Some(syn::GenericArgument::Type(t)) = env_ab.args.first() {
-                                return Some((true, true, t.clone()));
-                            }
-                        }
-                    } else {
-                        return Some((false, true, Type::Path(tp.clone())));
-                    }
-                }
-            }
-        }
-        // Arc<...>
-        if let syn::Type::Path(tp) = ty {
-            for seg in &tp.path.segments {
-                if seg.ident == "Arc" {
-                    if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
-                        if let Some(syn::GenericArgument::Type(syn::Type::Path(inner))) =
-                            ab.args.first()
-                        {
-                            // Arc<...>
-                            if let Some(last) = inner.path.segments.last() {
-                                if last.ident == "Envelope" {
-                                    if let syn::PathArguments::AngleBracketed(env_ab) =
-                                        &last.arguments
-                                    {
-                                        if let Some(syn::GenericArgument::Type(t)) =
-                                            env_ab.args.first()
-                                        {
-                                            return Some((true, false, t.clone()));
-                                        }
-                                    }
-                                } else {
-                                    // Arc<T>
-                                    return Some((false, false, Type::Path(inner.clone())));
-                                }
-                            }
-                        }
-                    }
-                }
+                return Some(Type::Path(tp.clone()));
             }
         }
         None
@@ -331,39 +282,17 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                 }
             }
 
-            // 解析参数：可选注入 &ComponentContext 或 &ScopedBus；消息参数必须是 Arc<Envelope<T>> 或 Arc<T>
-            let mut wants_ctx = false;
-            let mut wants_sb = false;
-            let mut msg: Option<(bool, bool, Type)> = None;
+        // 解析参数：可选注入 &ComponentContext；消息参数必须是 &T
+        let mut wants_ctx = false;
+        let mut msg: Option<Type> = None;
             for arg in &m.sig.inputs {
                 if let syn::FnArg::Typed(pat_ty) = arg {
-                    let (is_ctx, is_sb) = is_ctx_type(&pat_ty.ty);
-                    if is_ctx {
-                        wants_ctx = true;
-                        continue;
-                    }
-                    if is_sb {
-                        wants_sb = true;
-                        continue;
-                    }
-                    if msg.is_none() {
-                        msg = parse_msg_arg(&pat_ty.ty);
-                    }
+            if is_ctx_type(&pat_ty.ty) { wants_ctx = true; continue; }
+            if msg.is_none() { msg = parse_msg_arg_ref(&pat_ty.ty); }
                 }
             }
-            // 先用方法签名确定“形态”（Envelope/T），类型可被 #[handle(T)] 覆盖
-            let (sub_is_env, param_is_ref, mut msg_ty) =
-                if let Some((is_env, by_ref, t)) = msg.clone() {
-                    (is_env, by_ref, t)
-                } else if let Some(t) = attr.msg_ty.clone() {
-                    // 未从签名解析出参数时，默认 Envelope 形态
-                    (true, false, t)
-                } else {
-                    continue; // 无法推断
-                };
-            if let Some(over) = attr.msg_ty {
-                msg_ty = over;
-            }
+        // 确定消息类型：优先从 &T 形参推断，否则从 #[handle(T)] 提供
+            let msg_ty = if let Some(t) = msg.clone() { t } else if let Some(t) = attr.msg_ty.clone() { t } else { continue };
 
             // 生成过滤表达式
             let pattern_tokens = if let Some(from_ty) = attr.from_service.clone() {
@@ -376,27 +305,24 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                         )
                         .to_compile_error(),
                     );
-                    quote! { mmg_microbus::bus::ServicePattern::for_kind::<#from_ty>() }
+                    quote! { mmg_microbus::bus::Address::for_kind::<#from_ty>() }
                 } else if let Some(inst_ty) = attr.instance_ty.clone() {
-                    quote! { mmg_microbus::bus::ServicePattern::for_instance_marker::<#from_ty, #inst_ty>() }
+                    quote! { mmg_microbus::bus::Address::of_instance::<#from_ty, #inst_ty>() }
                 } else {
-                    quote! { mmg_microbus::bus::ServicePattern::for_kind::<#from_ty>() }
+                    quote! { mmg_microbus::bus::Address::for_kind::<#from_ty>() }
                 }
             } else if attr.instance_str.is_some() || attr.instance_ty.is_some() {
                 // 仅 instance 而缺少 from 类型：给出明确的编译期错误
                 compile_errors.push(quote! { compile_error!("#[handle]: `instance = ...` requires also specifying `from = ServiceType`"); });
-                quote! { mmg_microbus::bus::ServicePattern::any() }
+                quote! { mmg_microbus::bus::Address::any() }
             } else {
-                quote! { mmg_microbus::bus::ServicePattern::any() }
+                quote! { mmg_microbus::bus::Address::any() }
             };
 
             methods.push(MethodSpec {
                 ident: m.sig.ident.clone(),
-                sub_is_envelope: sub_is_env,
-                param_is_ref,
                 msg_ty,
                 wants_ctx,
-                wants_scoped_bus: wants_sb,
                 pattern_tokens,
             });
         }
@@ -410,57 +336,21 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
         let ty = &ms.msg_ty;
         let method_ident = &ms.ident;
         let pattern = &ms.pattern_tokens;
-        if ms.sub_is_envelope {
-            sub_decls.push(quote! {
-                let mut #sub_var = ctx
-                    .subscribe_pattern::<mmg_microbus::bus::Envelope<#ty>>(#pattern)
-                    .await;
-            });
-            let arg_env = if ms.param_is_ref {
-                quote! { &*env }
-            } else {
-                quote! { env }
-            };
-            let call = if ms.wants_ctx && ms.wants_scoped_bus {
-                quote! { this.#method_ident(&ctx, &ctx.scoped_bus, #arg_env).await }
-            } else if ms.wants_ctx {
-                quote! { this.#method_ident(&ctx, #arg_env).await }
-            } else if ms.wants_scoped_bus {
-                quote! { this.#method_ident(&ctx.scoped_bus, #arg_env).await }
-            } else {
-                quote! { this.#method_ident(#arg_env).await }
-            };
-            select_arms.push(quote! {
-                Some(env) = #sub_var.recv() => {
-                    if let Err(e) = #call { tracing::warn!(method = stringify!(#method_ident), error = ?e, "handler returned error"); }
-                }
-            });
+        sub_decls.push(quote! {
+            let mut #sub_var = ctx
+                .subscribe_pattern::<#ty>(#pattern)
+                .await;
+        });
+        let call = if ms.wants_ctx {
+            quote! { this.#method_ident(&ctx, &*env).await }
         } else {
-            sub_decls.push(quote! {
-                let mut #sub_var = ctx
-                    .subscribe_pattern::<#ty>(#pattern)
-                    .await;
-            });
-            let arg_env = if ms.param_is_ref {
-                quote! { &*env }
-            } else {
-                quote! { env }
-            };
-            let call = if ms.wants_ctx && ms.wants_scoped_bus {
-                quote! { this.#method_ident(&ctx, &ctx.scoped_bus, #arg_env).await }
-            } else if ms.wants_ctx {
-                quote! { this.#method_ident(&ctx, #arg_env).await }
-            } else if ms.wants_scoped_bus {
-                quote! { this.#method_ident(&ctx.scoped_bus, #arg_env).await }
-            } else {
-                quote! { this.#method_ident(#arg_env).await }
-            };
-            select_arms.push(quote! {
-                Some(env) = #sub_var.recv() => {
-                    if let Err(e) = #call { tracing::warn!(method = stringify!(#method_ident), error = ?e, "handler returned error"); }
-                }
-            });
-        }
+            quote! { this.#method_ident(&*env).await }
+        };
+        select_arms.push(quote! {
+            Some(env) = #sub_var.recv() => {
+                if let Err(e) = #call { tracing::warn!(method = stringify!(#method_ident), error = ?e, "handler returned error"); }
+            }
+        });
     }
 
     let gen_run = quote! {
@@ -479,10 +369,10 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                         changed = ctx.shutdown.changed() => {
                             if changed.is_ok() { break; } else { break; }
                         }
-                        // 配置热更：将 JSON 广播派发给该组件类型已注册的 #[configure] 处理器
+            // 配置热更：将强类型 Any 广播派发给该组件类型已注册的 #[configure] 处理器
             cfg_changed = ctx.config_rx.changed() => {
                             if cfg_changed.is_ok() {
-                                let v = ctx.current_config_json();
+                let v = ctx.current_config_any();
                                 let cfg_ctx = mmg_microbus::component::ConfigContext::from_component_ctx(&ctx);
                 for ce in mmg_microbus::inventory::iter::<mmg_microbus::config_registry::DesiredCfgEntry> {
                                     if (ce.0.component_kind)() == __kind_id {

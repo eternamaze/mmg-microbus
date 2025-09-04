@@ -14,15 +14,15 @@ struct Trader {
 
 #[mmg_microbus::handles]
 impl Trader {
-    // 只读 Envelope 形态（&Envelope<T>）
+    // 只读 &T 形态
     #[mmg_microbus::handle(Tick)]
     async fn on_tick_ro(
         &mut self,
         _ctx: &mmg_microbus::component::ComponentContext,
-        _env: &mmg_microbus::bus::Envelope<Tick>,
+        _tick: &Tick,
     ) -> anyhow::Result<()> {
         // 实际读取字段，避免 dead_code 告警
-        let _n = _env.msg.0;
+        let _n = _tick.0;
         Ok(())
     }
 
@@ -30,12 +30,12 @@ impl Trader {
     #[mmg_microbus::handle(Quote, from=External, instance=ExtAccept)]
     async fn on_quote_filtered(
         &mut self,
-        bus: &mmg_microbus::bus::ScopedBus,
+        ctx: &mmg_microbus::component::ComponentContext,
         _q: &Quote,
     ) -> anyhow::Result<()> {
         // 实际读取字段，避免 dead_code 告警
         let _p = _q.0;
-        bus.publish(Ack("ok")).await;
+        ctx.publish(Ack("ok")).await;
         Ok(())
     }
 }
@@ -56,7 +56,7 @@ async fn readonly_and_filters_work() {
 
     let h = app.bus_handle();
     let mut sub_ack = h
-        .subscribe_pattern::<Ack>(ServicePattern::for_kind::<Trader>())
+        .subscribe_pattern::<Ack>(mmg_microbus::bus::Address::for_kind::<Trader>())
         .await;
 
     // 不匹配的 instance：不应收到 Ack
@@ -66,7 +66,7 @@ async fn readonly_and_filters_work() {
             "ext-reject"
         }
     }
-    let ext_reject = mmg_microbus::bus::ServiceAddr::of_instance::<External, ExtReject>();
+    let ext_reject = mmg_microbus::bus::Address::of_instance::<External, ExtReject>();
     h.publish(&ext_reject, Quote(1.0)).await;
     let no_ack = tokio::time::timeout(std::time::Duration::from_millis(50), sub_ack.recv())
         .await
@@ -75,7 +75,7 @@ async fn readonly_and_filters_work() {
     assert!(no_ack.is_none(), "unexpected ack for mismatched instance");
 
     // 匹配的 instance：应收到 Ack
-    let ext_accept = mmg_microbus::bus::ServiceAddr::of_instance::<External, ExtAccept>();
+    let ext_accept = mmg_microbus::bus::Address::of_instance::<External, ExtAccept>();
     h.publish(&ext_accept, Quote(2.0)).await;
     let ack = tokio::time::timeout(std::time::Duration::from_secs(1), sub_ack.recv())
         .await
@@ -84,8 +84,8 @@ async fn readonly_and_filters_work() {
         .expect("no ack for matched filter");
     assert_eq!(ack.0, "ok");
 
-    // 发布只读 Envelope 匹配事件，确保不会触发 panic/类型错误
-    h.publish_enveloped(&ext_accept, Tick(1), None).await;
+    // 发布只读 Tick 匹配事件
+    h.publish(&ext_accept, Tick(1)).await;
 
     app.stop().await;
 }

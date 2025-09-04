@@ -6,7 +6,7 @@ struct C { id: mmg_microbus::bus::ComponentId }
 #[mmg_microbus::handles]
 impl C {
     #[mmg_microbus::handle(Tick, from=Src, instance="x")] // ERROR: string instance forbidden
-    async fn on_tick(&mut self, _env: std::sync::Arc<Envelope<Tick>>) -> Result<()> { Ok(()) }
+    async fn on_tick(&mut self, _tick: &Tick) -> Result<()> { Ok(()) }
 }
 
 #[derive(Clone)]

@@ -35,8 +35,6 @@ impl Default for AppConfig {
 pub struct ComponentConfig {
     pub id: String,
     pub kind: String,
-    #[serde(default)]
-    pub params: serde_json::Value,
 }
 
 // 配置结构体仅负责运行参数，不声明订阅或拓扑。

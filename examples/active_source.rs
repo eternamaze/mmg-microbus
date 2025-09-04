@@ -37,8 +37,8 @@ struct Trader {
 #[mmg_microbus::handles]
 impl Trader {
     #[mmg_microbus::handle(Tick, from=Feeder)]
-    async fn on_tick(&mut self, _tick: std::sync::Arc<Tick>) -> anyhow::Result<()> {
-        tracing::info!(target = "example.active", tick = _tick.0);
+    async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
+        tracing::info!(target = "example.active", tick = tick.0);
         Ok(())
     }
 }

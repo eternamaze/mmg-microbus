@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 #[cfg(feature = "bus-metrics")]
 use std::time::Instant;
-use std::time::SystemTime;
+//
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -17,7 +17,7 @@ use std::{
 use tokio::sync::{mpsc, RwLock};
 #[cfg(feature = "bus-metrics")]
 use tokio::time::Duration;
-use uuid::Uuid;
+//
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct KindId(TypeId);
@@ -58,34 +58,29 @@ impl fmt::Debug for ServiceAddr {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ServicePattern {
+pub struct Address {
     pub service: Option<KindId>,
     pub instance: Option<ComponentId>,
 }
-impl ServicePattern {
+impl Address {
     pub fn any() -> Self {
-        Self {
-            service: None,
-            instance: None,
-        }
+        Self { service: None, instance: None }
     }
     pub fn for_kind<T: 'static>() -> Self {
-        Self {
-            service: Some(KindId::of::<T>()),
-            instance: None,
+        Self { service: Some(KindId::of::<T>()), instance: None }
+    }
+    pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
+        Self { service: Some(KindId::of::<C>()), instance: Some(ComponentId(I::id().to_string())) }
+    }
+    fn require_exact(&self) -> Option<ServiceAddr> {
+        match (&self.service, &self.instance) {
+            (Some(s), Some(i)) => Some(ServiceAddr { service: *s, instance: i.clone() }),
+            _ => None,
         }
     }
-    pub fn matches(&self, addr: &ServiceAddr) -> bool {
-        (self
-            .service
-            .as_ref()
-            .map(|s| s == &addr.service)
-            .unwrap_or(true))
-            && (self
-                .instance
-                .as_ref()
-                .map(|i| i == &addr.instance)
-                .unwrap_or(true))
+    fn matches(&self, addr: &ServiceAddr) -> bool {
+        (self.service.as_ref().map(|s| s == &addr.service).unwrap_or(true))
+            && (self.instance.as_ref().map(|i| i == &addr.instance).unwrap_or(true))
     }
 }
 
@@ -96,18 +91,7 @@ pub trait InstanceMarker {
 
 impl ServiceAddr {
     pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
-        ServiceAddr {
-            service: KindId::of::<C>(),
-            instance: ComponentId(I::id().to_string()),
-        }
-    }
-}
-impl ServicePattern {
-    pub fn for_instance_marker<C: 'static, I: InstanceMarker>() -> Self {
-        Self {
-            service: Some(KindId::of::<C>()),
-            instance: Some(ComponentId(I::id().to_string())),
-        }
+        ServiceAddr { service: KindId::of::<C>(), instance: ComponentId(I::id().to_string()) }
     }
 }
 
@@ -158,7 +142,7 @@ struct Topic<T: Send + Sync + 'static> {
     txs: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
 }
 struct PatternTopic<T: Send + Sync + 'static> {
-    pattern: ServicePattern,
+    pattern: Address,
     txs: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
 }
 
@@ -203,11 +187,16 @@ impl Bus {
 }
 
 impl BusHandle {
-    pub async fn subscribe<T: Send + Sync + 'static>(&self, from: &ServiceAddr) -> Subscription<T> {
+    pub async fn subscribe<T: Send + Sync + 'static>(&self, from: &Address) -> Subscription<T> {
+        let exact = match from.require_exact() { Some(x) => x, None => {
+            tracing::error!("subscribe<T> requires exact Address (service+instance)");
+            let (_tx, rx) = mpsc::channel::<Arc<T>>(self.inner.default_capacity);
+            return Subscription { rx };
+        }};
         let mut topics = self.inner.topics.write().await;
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
-        let typed_map = topics.entry(from.clone()).or_insert_with(HashMap::new);
+        let typed_map = topics.entry(exact.clone()).or_insert_with(HashMap::new);
         let entry = typed_map.entry(type_id).or_insert_with(|| {
             Box::new(Topic::<T> {
                 txs: SmallVec::new(),
@@ -228,10 +217,7 @@ impl BusHandle {
         t.txs.push(tx);
         Subscription { rx }
     }
-    pub async fn subscribe_pattern<T: Send + Sync + 'static>(
-        &self,
-        pattern: ServicePattern,
-    ) -> Subscription<T> {
+    pub async fn subscribe_pattern<T: Send + Sync + 'static>(&self, pattern: Address) -> Subscription<T> {
         let mut patterns = self.inner.patterns.write().await;
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
@@ -243,7 +229,8 @@ impl BusHandle {
         }) as Box<dyn Any + Send + Sync>);
         Subscription { rx }
     }
-    pub async fn publish<T: Send + Sync + 'static>(&self, from: &ServiceAddr, msg: T) {
+    // 内部发送实现（统一入口）
+    async fn publish_inner<T: Send + Sync + 'static>(&self, from: &ServiceAddr, msg: T) {
         while self.inner.paused.load(Ordering::SeqCst) {
             #[cfg(feature = "bus-metrics")]
             {
@@ -451,22 +438,12 @@ impl BusHandle {
             }
         }
     }
-    pub async fn publish_enveloped<T: Send + Sync + 'static>(
-        &self,
-        from: &ServiceAddr,
-        payload: T,
-        trace_id: Option<Uuid>,
-    ) {
-        while self.inner.paused.load(Ordering::SeqCst) {
-            self.inner.resume_notify.notified().await;
+    pub async fn publish<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
+        if let Some(ex) = from.require_exact() {
+            self.publish_inner::<T>(&ex, msg).await;
+        } else {
+            tracing::warn!("publish<T> ignored: Address must be exact (service+instance)");
         }
-        let env = Envelope {
-            origin: from.clone(),
-            time: SystemTime::now(),
-            trace_id,
-            msg: payload,
-        };
-        self.publish::<Envelope<T>>(from, env).await;
     }
 
     #[cfg(test)]
@@ -495,67 +472,7 @@ impl BusHandle {
     }
 }
 
-#[derive(Clone)]
-pub struct ScopedBus {
-    handle: BusHandle,
-    pub self_addr: ServiceAddr,
-}
-impl ScopedBus {
-    pub fn new(handle: BusHandle, self_addr: ServiceAddr) -> Self {
-        Self { handle, self_addr }
-    }
-    pub async fn publish<T: Send + Sync + 'static>(&self, msg: T) {
-        self.handle.publish(&self.self_addr, msg).await;
-    }
-    pub async fn publish_enveloped<T: Send + Sync + 'static>(&self, msg: T) {
-        self.handle
-            .publish_enveloped(&self.self_addr, msg, None)
-            .await;
-    }
-    pub async fn subscribe_from<T: Send + Sync + 'static>(
-        &self,
-        from: &ServiceAddr,
-    ) -> Subscription<T> {
-        self.handle.subscribe::<T>(from).await
-    }
-    pub async fn subscribe_self<T: Send + Sync + 'static>(&self) -> Subscription<T> {
-        self.handle.subscribe::<T>(&self.self_addr).await
-    }
-    pub async fn subscribe_pattern<T: Send + Sync + 'static>(
-        &self,
-        pattern: ServicePattern,
-    ) -> Subscription<T> {
-        self.handle.subscribe_pattern::<T>(pattern).await
-    }
-
-    /// 从标记类型来源发布（类型安全实例 ID）
-    pub async fn publish_from_marker<S: 'static, I: InstanceMarker, T: Send + Sync + 'static>(
-        &self,
-        msg: T,
-    ) {
-        let from = ServiceAddr::of_instance::<S, I>();
-        self.handle.publish(&from, msg).await;
-    }
-    pub async fn publish_from_marker_enveloped<
-        S: 'static,
-        I: InstanceMarker,
-        T: Send + Sync + 'static,
-    >(
-        &self,
-        msg: T,
-    ) {
-        let from = ServiceAddr::of_instance::<S, I>();
-        self.handle.publish_enveloped(&from, msg, None).await;
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Envelope<T: Send + Sync + 'static> {
-    pub origin: ServiceAddr,
-    pub time: SystemTime,
-    pub trace_id: Option<Uuid>,
-    pub msg: T,
-}
+// 统一地址模型：一个类型同时表示精确地址与模式（通过 Option 实现）
 
 // Backpressure 已移除：总线采用阻塞发送实现，确保不丢包（在队列容量范围内）。
 
@@ -720,7 +637,7 @@ impl BusHandle {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn wildcard_and_envelope_work() {
+    async fn wildcard_and_pattern_work() {
         #[cfg(feature = "bus-metrics")]
         let bus = Bus::new(8, None);
         #[cfg(not(feature = "bus-metrics"))]
@@ -739,25 +656,18 @@ mod tests {
                 "b"
             }
         }
-        let a = ServiceAddr::of_instance::<S, A>();
-        let b = ServiceAddr::of_instance::<S, B>();
+    let a_exact = ServiceAddr::of_instance::<S, A>();
+    let b_exact = ServiceAddr::of_instance::<S, B>();
         #[derive(Clone, Debug)]
         struct Evt(u32);
         let mut sub = h
-            .subscribe_pattern::<Evt>(ServicePattern {
-                service: Some(KindId::of::<S>()),
-                instance: None,
-            })
+            .subscribe_pattern::<Evt>(Address { service: Some(KindId::of::<S>()), instance: None })
             .await;
-        h.publish(&a, Evt(1)).await;
-        h.publish(&b, Evt(2)).await;
+        h.publish(&Address { service: Some(KindId::of::<S>()), instance: Some(a_exact.instance.clone()) }, Evt(1)).await;
+        h.publish(&Address { service: Some(KindId::of::<S>()), instance: Some(b_exact.instance.clone()) }, Evt(2)).await;
         let x = sub.recv().await.unwrap();
         let y = sub.recv().await.unwrap();
         assert!(matches!((x.0, y.0), (1, 2) | (2, 1)));
-        let mut sub_env = h.subscribe::<Envelope<Evt>>(&a).await;
-        h.publish_enveloped(&a, Evt(9), None).await;
-        let env = sub_env.recv().await.unwrap();
-        assert_eq!(env.msg.0, 9);
-        assert_eq!(env.origin.instance.0, "a".to_string());
+        // exact subscribe still works but is considered internal; here we check pattern only.
     }
 }

@@ -19,8 +19,8 @@ struct App { id: mmg_microbus::bus::ComponentId }
 #[mmg_microbus::handles]
 impl App {
   #[mmg_microbus::handle(Tick)]
-  async fn on_tick(&mut self, env: std::sync::Arc<Envelope<Tick>>) -> anyhow::Result<()> {
-    println!("tick {}", env.msg.0);
+  async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
+  println!("tick {}", tick.0);
     Ok(())
   }
 }
@@ -32,11 +32,11 @@ mmg_microbus::easy_main!();
 1) 标注组件：`#[component] struct S { id: ComponentId }`
 2) 写处理函数：`#[handles] impl S { async fn on_xxx(&mut self, ...T...) -> Result<()> }`
 3) 可选过滤：`#[handle(T, from=Kind, instance=MarkerType)]`（`MarkerType` 需实现 `InstanceMarker`）
-4) 启动：`mmg_microbus::easy_main!();`
+4) 启动：`mmg_microbus::easy_main!();`（内部调用 `App::run_until_ctrl_c()` 单一入口）
 
 签名即语义：
-- 参数形态：`&Envelope<T>`/`Arc<Envelope<T>>` 或 `&T`/`Arc<T>`
-- 可注入：`&ComponentContext` 与/或 `&ScopedBus`
+- 参数形态：`&T`
+- 可注入：`&ComponentContext`
 - 当签名无法推断时显式写 `#[handle(T)]`
 
 ## 组件是一等公民：主动消息源
@@ -58,7 +58,7 @@ impl mmg_microbus::component::Component for Feeder {
     let mut intv = tokio::time::interval(std::time::Duration::from_millis(200));
     loop {
       tokio::select! {
-        _ = intv.tick() => { n += 1; ctx.publish(Tick(n)).await; }
+  _ = intv.tick() => { n += 1; ctx.publish(Tick(n)).await; }
         changed = ctx.shutdown.changed() => { if changed.is_ok() { break; } else { break; } }
       }
     }
@@ -72,7 +72,7 @@ struct Trader { id: mmg_microbus::bus::ComponentId }
 #[mmg_microbus::handles]
 impl Trader {
   #[mmg_microbus::handle(Tick, from=Feeder)]
-  async fn on_tick(&mut self, _tick: std::sync::Arc<Tick>) -> anyhow::Result<()> {
+  async fn on_tick(&mut self, _tick: &Tick) -> anyhow::Result<()> {
     Ok(())
   }
 }
@@ -97,14 +97,14 @@ app.config(Cfg { queue_capacity: 256 }).await?;
 - 指标：可选特性 `bus-metrics`；默认关闭为零热路径成本。
 
 ## 强类型路由与模式订阅
-- 精确路由：`ServiceAddr::of_instance::<S, I>()`（`I: InstanceMarker`）。
-- 模式订阅：`ServicePattern::for_kind::<S>()` / `for_instance_marker::<S, I>()` / `any()`。
+- 唯一地址模型：`Address { service: Option<KindId>, instance: Option<ComponentId> }`
+- 精确地址：`Address::of_instance::<S, I>()`；模式：`Address::for_kind::<S>()` / `Address::any()`。
 
 示例：
 ```rust
-use mmg_microbus::bus::{Envelope, ServicePattern};
-let mut sub = ctx.subscribe_pattern::<Envelope<Tick>>(ServicePattern::for_kind::<Feeder>()).await;
-while let Some(env) = sub.recv().await { /* use env */ }
+use mmg_microbus::bus::Address;
+let mut sub = ctx.subscribe_pattern::<Tick>(Address::for_kind::<Feeder>()).await;
+while let Some(tick) = sub.recv().await { /* use tick */ }
 ```
 
 ## 宏快速参考（用户可用）
@@ -113,19 +113,19 @@ while let Some(env) = sub.recv().await { /* use env */ }
   - 要求：结构体需含字段 `id: ComponentId`；可选 `cfg` 字段（用于保存外部配置）。
 - #[handles]
   - 目标：为一个 `impl` 块内的处理方法生成 `Component::run` 与订阅/分发逻辑。
-  - 形参注入：可接受 `&ComponentContext`、`&ScopedBus`，以及消息参数 `&Envelope<T>`/`Arc<Envelope<T>>` 或 `&T`/`Arc<T>`。
+  - 形参注入：可接受 `&ComponentContext`，以及消息参数 `&T`。
   - 与 #[handle] 联合使用（见下）。
 - #[handle(T, from=Kind, instance=Marker)]
   - 目标：为方法声明处理的消息类型与（可选）来源过滤；`Marker` 为实现了 `InstanceMarker` 的零尺寸类型。
   - 备注：当方法签名无法推断 T 时必须显式写 `T`。
 - #[configure(T)]
   - 目标：声明组件的配置处理；需配合实现 `Configure<T>`，框架会在启动与热更新时调用。
-- easy_main! / easy_main_with_config!(cfg)
+- easy_main!
   - 目标：生成 Tokio 入口并运行应用；后者会在启动前注入一次性初始配置。
 
 ## 故障排查
 - 没收到消息：
-  - 方法参数需为 `Arc<Envelope<T>>` 或 `Arc<T>`；必要时显式写 `#[handle(T)]`。
+  - 方法参数需为 `&T`；必要时显式写 `#[handle(T)]`。
   - 检查过滤是否过严（from/instance）。
 - 配置未生效：确认已实现 `#[configure(T)]` 且类型匹配；运行期注入请用 `app.config`。
 
@@ -136,7 +136,7 @@ while let Some(env) = sub.recv().await { /* use env */ }
 
 ## 示例
 - 示例：
-  - `examples/final_showcase.rs`（来源过滤、实例约束、上下文/ScopedBus 注入、配置与外部发布）。
+  - `examples/final_showcase.rs`（来源过滤、实例约束、上下文注入、配置与外部发布）。
   - `examples/active_source.rs`（组件是一等公民；自定义 run 主动推送消息，其他组件用 #[handles] 订阅处理）。
 
 ---

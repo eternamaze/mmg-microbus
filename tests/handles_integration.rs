@@ -1,5 +1,4 @@
 use mmg_microbus::prelude::*;
-use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct Tick(pub u64);
@@ -15,28 +14,18 @@ struct Trader {
 
 #[mmg_microbus::handles]
 impl Trader {
-    // Envelope 形态，注入上下文
+    // &T 形态，注入上下文
     #[mmg_microbus::handle(Tick)]
-    async fn on_tick(
-        &mut self,
-        _ctx: &mmg_microbus::component::ComponentContext,
-        _env: Arc<mmg_microbus::bus::Envelope<Tick>>,
-    ) -> anyhow::Result<()> {
-        // 读取字段以避免 dead_code 的“字段未读”告警
-        let _n = _env.msg.0;
+    async fn on_tick(&mut self, _ctx: &mmg_microbus::component::ComponentContext, _tick: &Tick) -> anyhow::Result<()> {
+        let _n = _tick.0;
         Ok(())
     }
 
-    // 负载形态，注入 ScopedBus，发布 Ack
+    // 负载形态，通过上下文发布 Ack
     #[mmg_microbus::handle(Price)]
-    async fn on_price(
-        &mut self,
-        bus: &mmg_microbus::bus::ScopedBus,
-        _price: Arc<Price>,
-    ) -> anyhow::Result<()> {
-        // 读取字段以避免 dead_code 的“字段未读”告警
-        let _p = _price.0;
-        bus.publish(Ack("ok")).await;
+    async fn on_price(&mut self, ctx: &mmg_microbus::component::ComponentContext, price: &Price) -> anyhow::Result<()> {
+        let _p = price.0;
+        ctx.publish(Ack("ok")).await;
         Ok(())
     }
 }
@@ -51,7 +40,7 @@ async fn method_based_subscription_works() {
     // 订阅 Trader 发出的 Ack
     let h = app.bus_handle();
     let mut sub = h
-        .subscribe_pattern::<Ack>(ServicePattern::for_kind::<Trader>())
+        .subscribe_pattern::<Ack>(mmg_microbus::bus::Address::for_kind::<Trader>())
         .await;
 
     // 从外部来源发布消息
@@ -62,9 +51,9 @@ async fn method_based_subscription_works() {
             "ext-1"
         }
     }
-    let ext = mmg_microbus::bus::ServiceAddr::of_instance::<External, Ext1>();
+    let ext = mmg_microbus::bus::Address::of_instance::<External, Ext1>();
     h.publish(&ext, Price(1.0)).await;
-    h.publish_enveloped(&ext, Tick(1), None).await;
+    h.publish(&ext, Tick(1)).await;
 
     // 应能收到 Ack
     let ack = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 #[cfg(feature = "bus-metrics")]
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -18,10 +18,10 @@ pub struct App {
     started: bool,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_linger: std::time::Duration,
-    // per-component config channels for hot update
-    comp_cfg_txs: Vec<(String, tokio::sync::watch::Sender<serde_json::Value>)>,
-    // global, typed-config serialized as JSON; applied at start or via config() at runtime
-    init_cfg_json: Option<serde_json::Value>,
+    // per-component typed config channels (Any)
+    comp_cfg_txs: Vec<(String, tokio::sync::watch::Sender<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>,
+    // initial typed config blob (project-wide aggregate struct)
+    init_cfg_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl App {
@@ -53,19 +53,19 @@ impl App {
             shutdown_tx: tx,
             shutdown_linger: linger,
             comp_cfg_txs: Vec::new(),
-            init_cfg_json: None,
+            init_cfg_any: None,
         }
     }
     pub fn new_default() -> Self {
         Self::new(AppConfig::default())
     }
-    /// 统一配置入口：传入任意可序列化的配置类型，框架只负责分发，不参与构造。
+    /// 强类型配置入口：传入聚合配置结构体（项目自定义类型）。
     /// - 启动前调用：作为初始配置，在 start() 时注入到每个组件。
-    /// - 运行期调用：暂停总线，广播到所有组件的配置通道，作为热更新注入。
-    pub async fn config<T: serde::Serialize>(&mut self, cfg: T) -> Result<&mut Self> {
-        let v = serde_json::to_value(cfg).context("serialize config to json")?;
+    /// - 运行期调用：暂停总线，广播到所有组件的配置通道（Arc<dyn Any>），作为热更新注入。
+    pub async fn config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
+        let v: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(cfg);
         if !self.started {
-            self.init_cfg_json = Some(v);
+            self.init_cfg_any = Some(v);
             return Ok(self);
         }
         // runtime: pause -> broadcast -> tiny barrier -> resume
@@ -88,11 +88,7 @@ impl App {
                 let f = (e.0)();
                 let name = f.type_name();
                 let id = format!("{}-1", name);
-                self.cfg.components.push(ComponentConfig {
-                    id,
-                    kind: name.to_string(),
-                    params: serde_json::Value::Null,
-                });
+                self.cfg.components.push(ComponentConfig { id, kind: name.to_string() });
             }
         }
 
@@ -107,42 +103,26 @@ impl App {
                     break;
                 }
             }
-            let factory =
-                factory_opt.with_context(|| format!("unknown component kind: {}", cc.kind))?;
+            let factory = match factory_opt {
+                Some(f) => f,
+                None => {
+                    return Err(anyhow::anyhow!("unknown component kind: {}", cc.kind));
+                }
+            };
             let id = cc.id.clone();
             let bus_handle = handle.clone();
-            let params_owned = cc.params.clone();
+            // ComponentConfig no longer carries JSON params; typed config flows via App::config(T)
             let kind_id = factory.kind_id();
             let rx = self.shutdown_tx.subscribe();
-            // create per-component config watch
-            // 初始化每个组件的配置流：优先使用全局 init config，否则沿用默认（通常为 Null）
-            let init_v = self
-                .init_cfg_json
-                .clone()
-                .unwrap_or_else(|| params_owned.clone());
-            let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(init_v);
+            // create per-component typed config watch
+            // 初始化为全局 init_cfg_any（若提供）；否则使用空占位 Arc<()> 表示“无配置”。
+            let init_any = self.init_cfg_any.clone().unwrap_or_else(|| std::sync::Arc::new(()));
+            let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(init_any);
             self.comp_cfg_txs.push((id.clone(), cfg_tx));
             let fut = async move {
-                let parsed = factory
-                    .parse_config((!params_owned.is_null()).then_some(params_owned))
-                    .map_err(|e| {
-                        tracing::warn!(component = %id, kind = %factory.type_name(), error = ?e, "parse_config failed; falling back to build()");
-                        e
-                    })
-                    .ok();
-                let built = if let Some(cfg) = parsed {
-                    factory
-                        .build_with_config(
-                            crate::bus::ComponentId(id.clone()),
-                            bus_handle.clone(),
-                            cfg,
-                        )
-                        .await
-                } else {
-                    factory
-                        .build(crate::bus::ComponentId(id.clone()), bus_handle.clone())
-                        .await
-                };
+                let built = factory
+                    .build(crate::bus::ComponentId(id.clone()), bus_handle.clone())
+                    .await;
                 match built {
                     Ok(mut comp) => {
                         // Use type-based service kind for routing clarity
@@ -154,15 +134,14 @@ impl App {
                             cfg_rx,
                         );
                         // 配置处理：启动前调用一次（若注册了 #[configure(T)] ）
-                        let cfg_ctx = crate::component::ConfigContext::new(
+            let cfg_ctx = crate::component::ConfigContext::new(
                             crate::bus::ComponentId(id.clone()),
                             kind_id,
-                            ctx.scoped_bus.clone(),
                         );
                         for ce in inventory::iter::<crate::config_registry::DesiredCfgEntry> {
                             if (ce.0.component_kind)() == kind_id {
-                                let v = ctx.current_config_json();
-                                if let Err(e) = (ce.0.invoke)(&mut *comp, cfg_ctx.clone(), v).await
+                let v = ctx.current_config_any();
+                if let Err(e) = (ce.0.invoke)(&mut *comp, cfg_ctx.clone(), v).await
                                 {
                                     tracing::warn!(component = %id, error = ?e, "config handler failed at startup");
                                 }
@@ -210,7 +189,7 @@ impl App {
         self.start().await
     }
 
-    /// Run until Ctrl-C (SIGINT). Suitable for most dev runs: one line to start and block.
+    /// 单一启动入口：启动直至 Ctrl-C（SIGINT）。
     pub async fn run_until_ctrl_c(&mut self) -> Result<()> {
         self.bootstrap().await?;
         // Startup summary
@@ -222,28 +201,6 @@ impl App {
         // Wait for interrupt
         tokio::signal::ctrl_c().await.ok();
         self.stop().await;
-        Ok(())
-    }
-    /// 适合新手的一键运行：默认配置启动，直到 Ctrl+C 退出
-    pub async fn run_default() -> Result<()> {
-        let mut app = Self::new_default();
-        app.start().await?;
-        #[cfg(feature = "bus-metrics")]
-        {
-            // 给运行一小段时间以建立订阅
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        tokio::signal::ctrl_c().await.context("wait ctrl-c")?;
-        app.stop().await;
-        Ok(())
-    }
-    /// 适合新手的一键运行：注入一次性初始配置，直到 Ctrl+C 退出
-    pub async fn run_with_config<T: serde::Serialize>(cfg: T) -> Result<()> {
-        let mut app = Self::new_default();
-        app.config(cfg).await?;
-        app.start().await?;
-        tokio::signal::ctrl_c().await.context("wait ctrl-c")?;
-        app.stop().await;
         Ok(())
     }
 }
