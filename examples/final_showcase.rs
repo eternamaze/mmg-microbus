@@ -1,10 +1,9 @@
-//! 最终示例：单一路径、方法即订阅、配置即对象、上下文与过滤
-use mmg_microbus::prelude::*;
+//! 最终示例：单一路径（&T-only）、方法即订阅、配置即对象、上下文与过滤
 
 struct Tick(pub u64);
 struct Price(pub f64);
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct MyCfg {
     symbol: String,
     min_tick: u64,
@@ -18,26 +17,22 @@ struct Trader {
 
 #[mmg_microbus::handles]
 impl Trader {
-    // 订阅 Envelope<Tick>，可注入上下文与 ScopedBus
+    // 订阅 Tick（&T 形态），可注入上下文
     #[mmg_microbus::handle(Tick, from=Exchange)]
-    async fn on_tick(
-        &mut self,
-        bus: &mmg_microbus::bus::ScopedBus,
-        env: std::sync::Arc<Envelope<Tick>>,
-    ) -> anyhow::Result<()> {
+    async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, tick: &Tick) -> anyhow::Result<()> {
         let min_tick = self.cfg.as_ref().map(|c| c.min_tick).unwrap_or(1);
-        if min_tick > 0 && env.msg.0 % min_tick == 0 {
-            // 演示：以 Exchange::Binance 身份发布，从而命中下方的过滤器
-            bus.publish_from_marker::<Exchange, Binance, Price>(Price(env.msg.0 as f64))
-                .await;
+        if min_tick > 0 && tick.0 % min_tick == 0 {
+            // 以 Exchange::Binance 身份发布，从而命中下方的过滤器
+            let from = mmg_microbus::bus::Address::of_instance::<Exchange, Binance>();
+            ctx.publish_from(&from, Price(tick.0 as f64)).await;
         }
         Ok(())
     }
 
-    // 仅负载 T，按签名自动推断类型；按实例过滤
+    // &Price，按实例过滤
     #[mmg_microbus::handle(Price, from=Exchange, instance=Binance)]
-    async fn on_price_binance(&mut self, env: std::sync::Arc<Price>) -> anyhow::Result<()> {
-        tracing::info!(target = "price.binance", price = env.0);
+    async fn on_price_binance(&mut self, price: &Price) -> anyhow::Result<()> {
+        tracing::info!(target = "price.binance", price = price.0);
         Ok(())
     }
 }
@@ -76,9 +71,9 @@ async fn main() -> anyhow::Result<()> {
     app.start().await?;
     // 用 BusHandle 从外部来源发布几条 Tick，形成可见的消息流
     let h = app.bus_handle();
-    let ext = mmg_microbus::bus::ServiceAddr::of_instance::<Exchange, Binance>();
+    let ext = mmg_microbus::bus::Address::of_instance::<Exchange, Binance>();
     for i in 1..=5u64 {
-        h.publish_enveloped(&ext, Tick(i), None).await;
+    h.publish(&ext, Tick(i)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     app.stop().await;

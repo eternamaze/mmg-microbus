@@ -1,4 +1,4 @@
-use mmg_microbus::bus::{Bus, InstanceMarker, ServiceAddr, ServicePattern};
+use mmg_microbus::bus::{Address, Bus, InstanceMarker};
 
 #[derive(Clone, Debug)]
 struct Msg(u32);
@@ -31,12 +31,12 @@ async fn cleanup_after_drop_exact_and_pattern() {
     #[cfg(not(feature = "bus-metrics"))]
     let bus = Bus::new(8);
     let h = bus.handle();
-    let from = ServiceAddr::of_instance::<Producer, P1>();
+    let from = Address::of_instance::<Producer, P1>();
 
     // subscribe exact and pattern
     let mut sub_exact = h.subscribe::<Msg>(&from).await;
     let sub_pat = h
-        .subscribe_pattern::<Msg>(ServicePattern::for_kind::<Producer>())
+        .subscribe_pattern::<Msg>(Address::for_kind::<Producer>())
         .await;
 
     // drop pattern subscriber, trigger cleanup via publish
@@ -66,10 +66,10 @@ async fn cleanup_on_repeated_sub_unsub_pattern() {
     #[cfg(not(feature = "bus-metrics"))]
     let bus = Bus::new(4);
     let h = bus.handle();
-    let from = ServiceAddr::of_instance::<Producer, P2>();
+    let from = Address::of_instance::<Producer, P2>();
     for i in 0..10u32 {
         let sub = h
-            .subscribe_pattern::<Msg>(ServicePattern::for_instance_marker::<Producer, P2>())
+            .subscribe_pattern::<Msg>(Address::of_instance::<Producer, P2>())
             .await;
         drop(sub);
         h.publish(&from, Msg(i)).await; // trigger prune
@@ -84,7 +84,7 @@ async fn publish_with_no_subscribers_is_noop() {
     #[cfg(not(feature = "bus-metrics"))]
     let bus = Bus::new(2);
     let h = bus.handle();
-    let from = ServiceAddr::of_instance::<Producer, P3>();
+    let from = Address::of_instance::<Producer, P3>();
     // should not panic or block indefinitely
     h.publish(&from, Msg(0)).await;
     // No subscribers; just ensure it returns
