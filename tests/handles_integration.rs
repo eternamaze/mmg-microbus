@@ -16,14 +16,22 @@ struct Trader {
 impl Trader {
     // &T 形态，注入上下文
     #[mmg_microbus::handle(Tick)]
-    async fn on_tick(&mut self, _ctx: &mmg_microbus::component::ComponentContext, _tick: &Tick) -> anyhow::Result<()> {
+    async fn on_tick(
+        &mut self,
+        _ctx: &mmg_microbus::component::ComponentContext,
+        _tick: &Tick,
+    ) -> anyhow::Result<()> {
         let _n = _tick.0;
         Ok(())
     }
 
     // 负载形态，通过上下文发布 Ack
     #[mmg_microbus::handle(Price)]
-    async fn on_price(&mut self, ctx: &mmg_microbus::component::ComponentContext, price: &Price) -> anyhow::Result<()> {
+    async fn on_price(
+        &mut self,
+        ctx: &mmg_microbus::component::ComponentContext,
+        price: &Price,
+    ) -> anyhow::Result<()> {
         let _p = price.0;
         ctx.publish(Ack("ok")).await;
         Ok(())
