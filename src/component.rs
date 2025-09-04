@@ -51,21 +51,45 @@ impl ComponentContext {
         service: KindId,
         bus: BusHandle,
         shutdown: watch::Receiver<bool>,
-    config_rx: watch::Receiver<Arc<dyn Any + Send + Sync>>,
+        config_rx: watch::Receiver<Arc<dyn Any + Send + Sync>>,
     ) -> Self {
         let self_addr = ServiceAddr {
             service,
             instance: id.clone(),
         };
-    Self { id, self_addr, bus, shutdown, config_rx }
+        Self {
+            id,
+            self_addr,
+            bus,
+            shutdown,
+            config_rx,
+        }
     }
 
     // Keep a single constructor to avoid confusion; components are always typed by kind.
 
-    pub async fn subscribe_from<T: Send + Sync + 'static>(&self, from: &Address) -> crate::bus::Subscription<T> { self.bus.subscribe::<T>(from).await }
-    pub async fn subscribe_pattern<T: Send + Sync + 'static>(&self, pattern: Address) -> crate::bus::Subscription<T> { self.bus.subscribe_pattern::<T>(pattern).await }
-    pub async fn publish<T: Send + Sync + 'static>(&self, msg: T) { let me = Address { service: Some(self.self_addr.service), instance: Some(self.self_addr.instance.clone()) }; self.bus.publish(&me, msg).await; }
-    pub async fn publish_from<T: Send + Sync + 'static>(&self, from: &Address, msg: T) { self.bus.publish(from, msg).await; }
+    pub async fn subscribe_from<T: Send + Sync + 'static>(
+        &self,
+        from: &Address,
+    ) -> crate::bus::Subscription<T> {
+        self.bus.subscribe::<T>(from).await
+    }
+    pub async fn subscribe_pattern<T: Send + Sync + 'static>(
+        &self,
+        pattern: Address,
+    ) -> crate::bus::Subscription<T> {
+        self.bus.subscribe_pattern::<T>(pattern).await
+    }
+    pub async fn publish<T: Send + Sync + 'static>(&self, msg: T) {
+        let me = Address {
+            service: Some(self.self_addr.service),
+            instance: Some(self.self_addr.instance.clone()),
+        };
+        self.bus.publish(&me, msg).await;
+    }
+    pub async fn publish_from<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
+        self.bus.publish(from, msg).await;
+    }
     // 仅提供强类型通道（&T），不提供 Any 自动装配通道。
 
     // -------- Config helpers --------
@@ -86,10 +110,24 @@ impl ComponentContext {
 
 // ---- 配置注入上下文与契约 ----
 #[derive(Clone)]
-pub struct ConfigContext { pub id: ComponentId, pub self_addr: ServiceAddr }
+pub struct ConfigContext {
+    pub id: ComponentId,
+    pub self_addr: ServiceAddr,
+}
 impl ConfigContext {
-    pub fn new(id: ComponentId, service: KindId) -> Self { let self_addr = ServiceAddr { service, instance: id.clone() }; Self { id, self_addr } }
-    pub fn from_component_ctx(c: &ComponentContext) -> Self { Self { id: c.id.clone(), self_addr: c.self_addr.clone() } }
+    pub fn new(id: ComponentId, service: KindId) -> Self {
+        let self_addr = ServiceAddr {
+            service,
+            instance: id.clone(),
+        };
+        Self { id, self_addr }
+    }
+    pub fn from_component_ctx(c: &ComponentContext) -> Self {
+        Self {
+            id: c.id.clone(),
+            self_addr: c.self_addr.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -101,6 +139,6 @@ pub trait ConfigApplyDyn {
     fn apply<'a>(
         &'a mut self,
         ctx: ConfigContext,
-    v: Arc<dyn Any + Send + Sync>,
+        v: Arc<dyn Any + Send + Sync>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
 }

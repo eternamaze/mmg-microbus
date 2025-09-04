@@ -19,7 +19,10 @@ pub struct App {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_linger: std::time::Duration,
     // per-component typed config channels (Any)
-    comp_cfg_txs: Vec<(String, tokio::sync::watch::Sender<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>,
+    comp_cfg_txs: Vec<(
+        String,
+        tokio::sync::watch::Sender<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    )>,
     // initial typed config blob (project-wide aggregate struct)
     init_cfg_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -88,7 +91,10 @@ impl App {
                 let f = (e.0)();
                 let name = f.type_name();
                 let id = format!("{}-1", name);
-                self.cfg.components.push(ComponentConfig { id, kind: name.to_string() });
+                self.cfg.components.push(ComponentConfig {
+                    id,
+                    kind: name.to_string(),
+                });
             }
         }
 
@@ -116,7 +122,10 @@ impl App {
             let rx = self.shutdown_tx.subscribe();
             // create per-component typed config watch
             // 初始化为全局 init_cfg_any（若提供）；否则使用空占位 Arc<()> 表示“无配置”。
-            let init_any = self.init_cfg_any.clone().unwrap_or_else(|| std::sync::Arc::new(()));
+            let init_any = self
+                .init_cfg_any
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(()));
             let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(init_any);
             self.comp_cfg_txs.push((id.clone(), cfg_tx));
             let fut = async move {
@@ -134,14 +143,14 @@ impl App {
                             cfg_rx,
                         );
                         // 配置处理：启动前调用一次（若注册了 #[configure(T)] ）
-            let cfg_ctx = crate::component::ConfigContext::new(
+                        let cfg_ctx = crate::component::ConfigContext::new(
                             crate::bus::ComponentId(id.clone()),
                             kind_id,
                         );
                         for ce in inventory::iter::<crate::config_registry::DesiredCfgEntry> {
                             if (ce.0.component_kind)() == kind_id {
-                let v = ctx.current_config_any();
-                if let Err(e) = (ce.0.invoke)(&mut *comp, cfg_ctx.clone(), v).await
+                                let v = ctx.current_config_any();
+                                if let Err(e) = (ce.0.invoke)(&mut *comp, cfg_ctx.clone(), v).await
                                 {
                                     tracing::warn!(component = %id, error = ?e, "config handler failed at startup");
                                 }

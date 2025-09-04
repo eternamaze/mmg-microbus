@@ -245,7 +245,9 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                     .last()
                     .map(|s| s.ident.to_string())
                     .unwrap_or_default();
-                if last == "ComponentContext" { return true; }
+                if last == "ComponentContext" {
+                    return true;
+                }
             }
         }
         false
@@ -282,17 +284,28 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                 }
             }
 
-        // 解析参数：可选注入 &ComponentContext；消息参数必须是 &T
-        let mut wants_ctx = false;
-        let mut msg: Option<Type> = None;
+            // 解析参数：可选注入 &ComponentContext；消息参数必须是 &T
+            let mut wants_ctx = false;
+            let mut msg: Option<Type> = None;
             for arg in &m.sig.inputs {
                 if let syn::FnArg::Typed(pat_ty) = arg {
-            if is_ctx_type(&pat_ty.ty) { wants_ctx = true; continue; }
-            if msg.is_none() { msg = parse_msg_arg_ref(&pat_ty.ty); }
+                    if is_ctx_type(&pat_ty.ty) {
+                        wants_ctx = true;
+                        continue;
+                    }
+                    if msg.is_none() {
+                        msg = parse_msg_arg_ref(&pat_ty.ty);
+                    }
                 }
             }
-        // 确定消息类型：优先从 &T 形参推断，否则从 #[handle(T)] 提供
-            let msg_ty = if let Some(t) = msg.clone() { t } else if let Some(t) = attr.msg_ty.clone() { t } else { continue };
+            // 确定消息类型：优先从 &T 形参推断，否则从 #[handle(T)] 提供
+            let msg_ty = if let Some(t) = msg.clone() {
+                t
+            } else if let Some(t) = attr.msg_ty.clone() {
+                t
+            } else {
+                continue;
+            };
 
             // 生成过滤表达式
             let pattern_tokens = if let Some(from_ty) = attr.from_service.clone() {

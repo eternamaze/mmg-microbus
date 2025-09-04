@@ -64,23 +64,43 @@ pub struct Address {
 }
 impl Address {
     pub fn any() -> Self {
-        Self { service: None, instance: None }
+        Self {
+            service: None,
+            instance: None,
+        }
     }
     pub fn for_kind<T: 'static>() -> Self {
-        Self { service: Some(KindId::of::<T>()), instance: None }
+        Self {
+            service: Some(KindId::of::<T>()),
+            instance: None,
+        }
     }
     pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
-        Self { service: Some(KindId::of::<C>()), instance: Some(ComponentId(I::id().to_string())) }
+        Self {
+            service: Some(KindId::of::<C>()),
+            instance: Some(ComponentId(I::id().to_string())),
+        }
     }
     fn require_exact(&self) -> Option<ServiceAddr> {
         match (&self.service, &self.instance) {
-            (Some(s), Some(i)) => Some(ServiceAddr { service: *s, instance: i.clone() }),
+            (Some(s), Some(i)) => Some(ServiceAddr {
+                service: *s,
+                instance: i.clone(),
+            }),
             _ => None,
         }
     }
     fn matches(&self, addr: &ServiceAddr) -> bool {
-        (self.service.as_ref().map(|s| s == &addr.service).unwrap_or(true))
-            && (self.instance.as_ref().map(|i| i == &addr.instance).unwrap_or(true))
+        (self
+            .service
+            .as_ref()
+            .map(|s| s == &addr.service)
+            .unwrap_or(true))
+            && (self
+                .instance
+                .as_ref()
+                .map(|i| i == &addr.instance)
+                .unwrap_or(true))
     }
 }
 
@@ -91,7 +111,10 @@ pub trait InstanceMarker {
 
 impl ServiceAddr {
     pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
-        ServiceAddr { service: KindId::of::<C>(), instance: ComponentId(I::id().to_string()) }
+        ServiceAddr {
+            service: KindId::of::<C>(),
+            instance: ComponentId(I::id().to_string()),
+        }
     }
 }
 
@@ -188,11 +211,14 @@ impl Bus {
 
 impl BusHandle {
     pub async fn subscribe<T: Send + Sync + 'static>(&self, from: &Address) -> Subscription<T> {
-        let exact = match from.require_exact() { Some(x) => x, None => {
-            tracing::error!("subscribe<T> requires exact Address (service+instance)");
-            let (_tx, rx) = mpsc::channel::<Arc<T>>(self.inner.default_capacity);
-            return Subscription { rx };
-        }};
+        let exact = match from.require_exact() {
+            Some(x) => x,
+            None => {
+                tracing::error!("subscribe<T> requires exact Address (service+instance)");
+                let (_tx, rx) = mpsc::channel::<Arc<T>>(self.inner.default_capacity);
+                return Subscription { rx };
+            }
+        };
         let mut topics = self.inner.topics.write().await;
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
@@ -217,7 +243,10 @@ impl BusHandle {
         t.txs.push(tx);
         Subscription { rx }
     }
-    pub async fn subscribe_pattern<T: Send + Sync + 'static>(&self, pattern: Address) -> Subscription<T> {
+    pub async fn subscribe_pattern<T: Send + Sync + 'static>(
+        &self,
+        pattern: Address,
+    ) -> Subscription<T> {
         let mut patterns = self.inner.patterns.write().await;
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
@@ -656,15 +685,32 @@ mod tests {
                 "b"
             }
         }
-    let a_exact = ServiceAddr::of_instance::<S, A>();
-    let b_exact = ServiceAddr::of_instance::<S, B>();
+        let a_exact = ServiceAddr::of_instance::<S, A>();
+        let b_exact = ServiceAddr::of_instance::<S, B>();
         #[derive(Clone, Debug)]
         struct Evt(u32);
         let mut sub = h
-            .subscribe_pattern::<Evt>(Address { service: Some(KindId::of::<S>()), instance: None })
+            .subscribe_pattern::<Evt>(Address {
+                service: Some(KindId::of::<S>()),
+                instance: None,
+            })
             .await;
-        h.publish(&Address { service: Some(KindId::of::<S>()), instance: Some(a_exact.instance.clone()) }, Evt(1)).await;
-        h.publish(&Address { service: Some(KindId::of::<S>()), instance: Some(b_exact.instance.clone()) }, Evt(2)).await;
+        h.publish(
+            &Address {
+                service: Some(KindId::of::<S>()),
+                instance: Some(a_exact.instance.clone()),
+            },
+            Evt(1),
+        )
+        .await;
+        h.publish(
+            &Address {
+                service: Some(KindId::of::<S>()),
+                instance: Some(b_exact.instance.clone()),
+            },
+            Evt(2),
+        )
+        .await;
         let x = sub.recv().await.unwrap();
         let y = sub.recv().await.unwrap();
         assert!(matches!((x.0, y.0), (1, 2) | (2, 1)));

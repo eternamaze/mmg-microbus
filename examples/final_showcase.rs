@@ -19,7 +19,11 @@ struct Trader {
 impl Trader {
     // 订阅 Tick（&T 形态），可注入上下文
     #[mmg_microbus::handle(Tick, from=Exchange)]
-    async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, tick: &Tick) -> anyhow::Result<()> {
+    async fn on_tick(
+        &mut self,
+        ctx: &mmg_microbus::component::ComponentContext,
+        tick: &Tick,
+    ) -> anyhow::Result<()> {
         let min_tick = self.cfg.as_ref().map(|c| c.min_tick).unwrap_or(1);
         if min_tick > 0 && tick.0 % min_tick == 0 {
             // 以 Exchange::Binance 身份发布，从而命中下方的过滤器
@@ -73,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let h = app.bus_handle();
     let ext = mmg_microbus::bus::Address::of_instance::<Exchange, Binance>();
     for i in 1..=5u64 {
-    h.publish(&ext, Tick(i)).await;
+        h.publish(&ext, Tick(i)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     app.stop().await;
