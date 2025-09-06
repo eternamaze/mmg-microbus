@@ -12,7 +12,6 @@ pub type CfgInvokeFn = for<'a> fn(
 
 pub struct DesiredCfgSpec {
     pub component_kind: fn() -> KindId,
-    pub cfg_type: fn() -> std::any::TypeId,
     pub invoke: CfgInvokeFn,
 }
 pub struct DesiredCfgEntry(pub DesiredCfgSpec);

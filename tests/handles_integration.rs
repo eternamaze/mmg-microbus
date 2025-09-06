@@ -40,7 +40,8 @@ impl Trader {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn method_based_subscription_works() {
-    let mut app = App::new_default();
+    let mut app = App::new(Default::default());
+    app.add_component::<Trader>("trader-1");
     app.start().await.unwrap();
     // 等待组件完成订阅建立，避免发布过早导致丢失
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;

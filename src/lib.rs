@@ -15,15 +15,4 @@ pub mod prelude {
 pub use microbus_macros::*;
 // 供宏展开使用，避免下游使用者/trybuild 用例显式依赖 inventory
 pub use inventory;
-
-// 最简主函数宏：自动生成 tokio 入口并运行 App::run_until_ctrl_c()
-#[macro_export]
-macro_rules! easy_main {
-    () => {
-        #[::tokio::main(flavor = "multi_thread")]
-        async fn main() -> ::anyhow::Result<()> {
-            let mut app = ::mmg_microbus::prelude::App::new_default();
-            app.run_until_ctrl_c().await
-        }
-    };
-}
+// 不再提供具体化主函数宏；框架仅提供标准启停 API

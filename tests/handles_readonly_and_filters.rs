@@ -50,7 +50,8 @@ impl mmg_microbus::bus::InstanceMarker for ExtAccept {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn readonly_and_filters_work() {
-    let mut app = App::new_default();
+    let mut app = App::new(Default::default());
+    app.add_component::<Trader>("trader-1");
     app.start().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 

@@ -43,4 +43,14 @@ impl Trader {
     }
 }
 
-mmg_microbus::easy_main!();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    // 显式注册组件实例（类型安全）
+    let mut app = mmg_microbus::prelude::App::new(Default::default());
+    app.add_component::<Trader>("trader-1");
+    app.start().await?;
+    // 运行一小段时间后退出
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    app.stop().await;
+    Ok(())
+}

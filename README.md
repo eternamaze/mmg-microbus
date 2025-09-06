@@ -18,8 +18,15 @@ impl App {
   println!("tick {}", tick.0); Ok(())
   }
 }
-
-mmg_microbus::easy_main!(); // 单一启动入口（run_until_ctrl_c）
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+  let mut app = mmg_microbus::prelude::App::new(Default::default());
+  app.add_component::<App>("app");
+  app.start().await?;
+  // 业务发布/运行...
+  app.stop().await;
+  Ok(())
+}
 ```
 
 完整示例：见 `examples/final_showcase.rs`（来源过滤、实例约束、上下文注入与自发布）。
@@ -27,9 +34,8 @@ mmg_microbus::easy_main!(); // 单一启动入口（run_until_ctrl_c）
 使用要点
 - 默认参数形态：`&T`；可按需注入 `&ComponentContext`。
 - 过滤注解：使用类型标记 `#[handle(T, from=ServiceType, instance=MarkerType)]`（`MarkerType` 必须实现 `InstanceMarker`）。
-- 配置注入：`#[configure(MyCfg)] + impl Configure<MyCfg>`；`App.config(AggregateCfg { .. })` 传入强类型聚合配置，运行时按类型分发（无序列化/反序列化）。
+- 配置注入：`#[configure(MyCfg)] + impl Configure<MyCfg>`；启动前通过 `app.config(AggregateCfg { .. })` 一次性注入（不支持热更新，无需序列化/反序列化）。
 - 运行语义：阻塞直送不丢包；按需清理，无周期扫描；单订阅快路径与小向量优化。
-- 指标特性：`bus-metrics` 关闭为零成本；开启后记录发布/投递/延迟/暂停等待/fanout 等。
 
 推荐默认路径（面向使用者的一致心智）
 - 发布：在 handler 中通过 `ComponentContext::publish(msg)`；外部通过 `App::bus_handle().publish(Address::of_instance::<S, I>(), msg)`。

@@ -3,7 +3,7 @@
 struct Tick(pub u64);
 struct Price(pub f64);
 
-#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone)]
 struct MyCfg {
     symbol: String,
     min_tick: u64,
@@ -36,7 +36,12 @@ impl Trader {
     // &Price，按实例过滤
     #[mmg_microbus::handle(Price, from=Exchange, instance=Binance)]
     async fn on_price_binance(&mut self, price: &Price) -> anyhow::Result<()> {
-        tracing::info!(target = "price.binance", price = price.0);
+        let symbol = self
+            .cfg
+            .as_ref()
+            .map(|c| c.symbol.as_str())
+            .unwrap_or("<unknown>");
+        tracing::info!(target = "price.binance", %symbol, price = price.0);
         Ok(())
     }
 }
@@ -65,8 +70,9 @@ impl mmg_microbus::bus::InstanceMarker for Binance {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    // 启动应用并注入一次性配置
-    let mut app = mmg_microbus::prelude::App::new_default();
+    // 显式注册组件配置（类型安全）
+    let mut app = mmg_microbus::prelude::App::new(Default::default());
+    app.add_component::<Trader>("trader-1");
     app.config(MyCfg {
         symbol: "BTCUSDT".into(),
         min_tick: 1,

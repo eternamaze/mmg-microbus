@@ -99,7 +99,6 @@ pub fn configure(args: TokenStream, input: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         const _: () = {
             fn __kind() -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#self_ty>() }
-            fn __cfg() -> std::any::TypeId { std::any::TypeId::of::<#ty>() }
             impl mmg_microbus::component::ConfigApplyDyn for #self_ty {
                 fn apply<'a>(
                     &'a mut self,
@@ -127,7 +126,7 @@ pub fn configure(args: TokenStream, input: TokenStream) -> TokenStream {
                     Box::pin(async { Ok(()) })
                 }
             }
-            mmg_microbus::inventory::submit! { mmg_microbus::config_registry::DesiredCfgEntry(mmg_microbus::config_registry::DesiredCfgSpec { component_kind: __kind, cfg_type: __cfg, invoke: __invoke }) }
+            mmg_microbus::inventory::submit! { mmg_microbus::config_registry::DesiredCfgEntry(mmg_microbus::config_registry::DesiredCfgSpec { component_kind: __kind, invoke: __invoke }) }
         };
     };
     expanded.into()
@@ -341,7 +340,7 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
 
-    // 生成 run()：为每个 handler 创建订阅，并在 select 循环中分发；同时监听配置热更新
+    // 生成 run()：为每个 handler 创建订阅，并在 select 循环中分发
     let mut sub_decls = Vec::new();
     let mut select_arms = Vec::new();
     for (idx, ms) in methods.iter().enumerate() {
@@ -376,23 +375,11 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                 #(#sub_decls)*
                 // 组件类型 KindId
                 let __kind_id = mmg_microbus::bus::KindId::of::<#self_ty>();
-                // 主循环：监听关停、配置热更与各类型订阅
+                // 主循环：监听关停与各类型订阅
                 loop {
                     tokio::select! {
                         changed = ctx.shutdown.changed() => {
                             if changed.is_ok() { break; } else { break; }
-                        }
-            // 配置热更：将强类型 Any 广播派发给该组件类型已注册的 #[configure] 处理器
-            cfg_changed = ctx.config_rx.changed() => {
-                            if cfg_changed.is_ok() {
-                let v = ctx.current_config_any();
-                                let cfg_ctx = mmg_microbus::component::ConfigContext::from_component_ctx(&ctx);
-                for ce in mmg_microbus::inventory::iter::<mmg_microbus::config_registry::DesiredCfgEntry> {
-                                    if (ce.0.component_kind)() == __kind_id {
-                                        let _ = (ce.0.invoke)(&mut this, cfg_ctx.clone(), v.clone()).await;
-                                    }
-                                }
-                            }
                         }
                         #(#select_arms)*
                     }

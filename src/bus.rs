@@ -1,11 +1,7 @@
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ComponentId(pub String);
 use smallvec::SmallVec;
-#[cfg(feature = "bus-metrics")]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-#[cfg(feature = "bus-metrics")]
-use std::time::Instant;
 //
 use std::{
     any::{Any, TypeId},
@@ -15,8 +11,6 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{mpsc, RwLock};
-#[cfg(feature = "bus-metrics")]
-use tokio::time::Duration;
 //
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -140,8 +134,6 @@ struct BusInner {
     topics: RwLock<ServiceTopics>,
     patterns: RwLock<HashMap<TypeId, PatternHandlers>>,
     default_capacity: usize,
-    #[cfg(feature = "bus-metrics")]
-    metrics: Option<Arc<BusMetrics>>,
     paused: std::sync::atomic::AtomicBool,
     resume_notify: tokio::sync::Notify,
 }
@@ -173,23 +165,6 @@ pub struct Bus {
     handle: BusHandle,
 }
 impl Bus {
-    #[cfg(feature = "bus-metrics")]
-    pub fn new(default_capacity: usize, metrics: Option<Arc<BusMetrics>>) -> Self {
-        let inner = BusInner {
-            topics: RwLock::new(HashMap::new()),
-            patterns: RwLock::new(HashMap::new()),
-            default_capacity,
-            metrics,
-            paused: std::sync::atomic::AtomicBool::new(false),
-            resume_notify: tokio::sync::Notify::new(),
-        };
-        Self {
-            handle: BusHandle {
-                inner: Arc::new(inner),
-            },
-        }
-    }
-    #[cfg(not(feature = "bus-metrics"))]
     pub fn new(default_capacity: usize) -> Self {
         let inner = BusInner {
             topics: RwLock::new(HashMap::new()),
@@ -261,25 +236,10 @@ impl BusHandle {
     // 内部发送实现（统一入口）
     async fn publish_inner<T: Send + Sync + 'static>(&self, from: &ServiceAddr, msg: T) {
         while self.inner.paused.load(Ordering::SeqCst) {
-            #[cfg(feature = "bus-metrics")]
-            {
-                let t0 = Instant::now();
-                self.inner.resume_notify.notified().await;
-                if let Some(m) = &self.inner.metrics {
-                    m.record_pause(t0.elapsed());
-                }
-            }
-            #[cfg(not(feature = "bus-metrics"))]
-            {
-                self.inner.resume_notify.notified().await;
-            }
+            self.inner.resume_notify.notified().await;
         }
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
-        #[cfg(feature = "bus-metrics")]
-        if let Some(m) = &self.inner.metrics {
-            m.published.fetch_add(1, Ordering::Relaxed);
-        }
         let senders_exact: Option<Vec<mpsc::Sender<Arc<T>>>> = {
             let topics = self.inner.topics.read().await;
             if let Some(typed_map) = topics.get(from) {
@@ -322,45 +282,18 @@ impl BusHandle {
         if total == 0 {
             return;
         }
-        #[cfg(feature = "bus-metrics")]
-        if let Some(m) = &self.inner.metrics {
-            m.record_fanout(total);
-            m.inc_inflight();
-        }
-        // 单一路径：阻塞发送（不丢包）。保持最小必要队列，抵抗短暂抖动。
-        #[cfg(feature = "bus-metrics")]
-        let start = self.inner.metrics.as_ref().map(|_| Instant::now());
-        #[cfg(feature = "bus-metrics")]
-        let mut delivered = 0;
+    // 单一路径：阻塞发送（不丢包）。保持最小必要队列，抵抗短暂抖动。
         // total==1 快路径：不分配 recipients 容器
         if total == 1 {
             if let Some(s) = &senders_exact {
                 if let Some(tx) = s.iter().find(|tx| !tx.is_closed()) {
-                    if tx.send(arc).await.is_ok() {
-                        #[cfg(feature = "bus-metrics")]
-                        {
-                            delivered += 1;
-                        }
-                    }
-                    #[cfg(feature = "bus-metrics")]
-                    if let Some(m) = &self.inner.metrics {
-                        m.delivered.fetch_add(delivered, Ordering::Relaxed);
-                        if let Some(s) = start {
-                            m.record_latency(s.elapsed());
-                        }
-                        m.dec_inflight();
-                    }
+                    let _ = tx.send(arc).await;
                     return;
                 }
             }
             // exact 没找到就一定在 patterns 中
             if let Some(tx) = senders_patterns.iter().find(|tx| !tx.is_closed()) {
-                if tx.send(arc).await.is_ok() {
-                    #[cfg(feature = "bus-metrics")]
-                    {
-                        delivered += 1;
-                    }
-                }
+                let _ = tx.send(arc).await;
             }
         } else {
             // 统一收集所有仍然开启的接收者，最后一个使用 move，其余 clone，避免多余 Arc 克隆
@@ -381,27 +314,9 @@ impl BusHandle {
             debug_assert_eq!(recipients.len(), total);
             // 前 total-1 个 clone 发送，最后一个 move 发送
             for i in 0..(total - 1) {
-                if recipients[i].send(arc.clone()).await.is_ok() {
-                    #[cfg(feature = "bus-metrics")]
-                    {
-                        delivered += 1;
-                    }
-                }
+                let _ = recipients[i].send(arc.clone()).await;
             }
-            if recipients[total - 1].send(arc).await.is_ok() {
-                #[cfg(feature = "bus-metrics")]
-                {
-                    delivered += 1;
-                }
-            }
-        }
-        #[cfg(feature = "bus-metrics")]
-        if let Some(m) = &self.inner.metrics {
-            m.delivered.fetch_add(delivered, Ordering::Relaxed);
-            if let Some(s) = start {
-                m.record_latency(s.elapsed());
-            }
-            m.dec_inflight();
+            let _ = recipients[total - 1].send(arc).await;
         }
         // 按需清理：仅当检测到 sender 关闭或数量变化时进入写锁
         let mut need_clean_topics = false;
@@ -461,10 +376,7 @@ impl BusHandle {
                     *list = new_list;
                 }
             }
-            #[cfg(feature = "bus-metrics")]
-            if let Some(m) = &self.inner.metrics {
-                m.pruned.fetch_add(1, Ordering::Relaxed);
-            }
+
         }
     }
     pub async fn publish<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
@@ -505,172 +417,14 @@ impl BusHandle {
 
 // Backpressure 已移除：总线采用阻塞发送实现，确保不丢包（在队列容量范围内）。
 
-#[cfg(feature = "bus-metrics")]
-pub struct BusMetrics {
-    published: AtomicU64,
-    delivered: AtomicU64,
-    pruned: AtomicU64,
-    hist_ms: [AtomicU64; 12],
-    inflight: AtomicU64,
-    max_inflight: AtomicU64,
-    pause_waits: AtomicU64,
-    pause_hist_ms: [AtomicU64; 8],
-    fanout_hist: [AtomicU64; 8],
-}
-#[cfg(feature = "bus-metrics")]
-impl Default for BusMetrics {
-    fn default() -> Self {
-        fn a() -> AtomicU64 {
-            AtomicU64::new(0)
-        }
-        Self {
-            published: a(),
-            delivered: a(),
-            pruned: a(),
-            hist_ms: [a(), a(), a(), a(), a(), a(), a(), a(), a(), a(), a(), a()],
-            inflight: a(),
-            max_inflight: a(),
-            pause_waits: a(),
-            pause_hist_ms: [a(), a(), a(), a(), a(), a(), a(), a()],
-            fanout_hist: [a(), a(), a(), a(), a(), a(), a(), a()],
-        }
-    }
-}
-#[cfg(feature = "bus-metrics")]
-impl BusMetrics {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    fn bucket_idx_ms(ms: u128) -> usize {
-        match ms {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3..=5 => 3,
-            6..=10 => 4,
-            11..=20 => 5,
-            21..=50 => 6,
-            51..=100 => 7,
-            101..=200 => 8,
-            201..=500 => 9,
-            501..=1000 => 10,
-            _ => 11,
-        }
-    }
-    pub fn record_latency(&self, dur: Duration) {
-        let ms = dur.as_millis();
-        let idx = Self::bucket_idx_ms(ms);
-        self.hist_ms[idx].fetch_add(1, Ordering::Relaxed);
-    }
-    fn bucket_idx_pause(ms: u128) -> usize {
-        match ms {
-            0 => 0,
-            1..=2 => 1,
-            3..=5 => 2,
-            6..=10 => 3,
-            11..=20 => 4,
-            21..=50 => 5,
-            51..=100 => 6,
-            _ => 7,
-        }
-    }
-    pub fn record_pause(&self, dur: Duration) {
-        let ms = dur.as_millis();
-        let idx = Self::bucket_idx_pause(ms);
-        self.pause_waits.fetch_add(1, Ordering::Relaxed);
-        self.pause_hist_ms[idx].fetch_add(1, Ordering::Relaxed);
-    }
-    fn bucket_idx_fanout(n: usize) -> usize {
-        match n {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3..=5 => 3,
-            6..=10 => 4,
-            11..=20 => 5,
-            21..=50 => 6,
-            _ => 7,
-        }
-    }
-    pub fn record_fanout(&self, n: usize) {
-        let idx = Self::bucket_idx_fanout(n);
-        self.fanout_hist[idx].fetch_add(1, Ordering::Relaxed);
-    }
-    pub fn inc_inflight(&self) {
-        let now = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
-        // 简单的最大值更新（无锁）
-        let mut cur_max = self.max_inflight.load(Ordering::Relaxed);
-        while now > cur_max {
-            match self.max_inflight.compare_exchange(
-                cur_max,
-                now,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(v) => cur_max = v,
-            }
-        }
-    }
-    pub fn dec_inflight(&self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-    }
-    pub fn snapshot(&self) -> BusMetricsSnapshot {
-        let mut hist = [0u64; 12];
-        for i in 0..12 {
-            hist[i] = self.hist_ms[i].load(Ordering::Relaxed);
-        }
-        let mut pause = [0u64; 8];
-        for i in 0..8 {
-            pause[i] = self.pause_hist_ms[i].load(Ordering::Relaxed);
-        }
-        let mut fan = [0u64; 8];
-        for i in 0..8 {
-            fan[i] = self.fanout_hist[i].load(Ordering::Relaxed);
-        }
-        BusMetricsSnapshot {
-            published: self.published.load(Ordering::Relaxed),
-            delivered: self.delivered.load(Ordering::Relaxed),
-            pruned: self.pruned.load(Ordering::Relaxed),
-            hist_ms: hist,
-            inflight: self.inflight.load(Ordering::Relaxed),
-            max_inflight: self.max_inflight.load(Ordering::Relaxed),
-            pause_waits: self.pause_waits.load(Ordering::Relaxed),
-            pause_hist_ms: pause,
-            fanout_hist: fan,
-        }
-    }
-}
-
-#[cfg(feature = "bus-metrics")]
-#[derive(Clone, Copy, Debug)]
-pub struct BusMetricsSnapshot {
-    pub published: u64,
-    pub delivered: u64,
-    pub pruned: u64,
-    pub hist_ms: [u64; 12],
-    pub inflight: u64,
-    pub max_inflight: u64,
-    pub pause_waits: u64,
-    pub pause_hist_ms: [u64; 8],
-    pub fanout_hist: [u64; 8],
-}
-#[cfg(feature = "bus-metrics")]
-impl BusHandle {
-    pub fn metrics_snapshot(&self) -> Option<BusMetricsSnapshot> {
-        self.inner.metrics.as_ref().map(|m| m.snapshot())
-    }
-}
+// 已移除总线指标功能：简化核心总线实现。
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn wildcard_and_pattern_work() {
-        #[cfg(feature = "bus-metrics")]
-        let bus = Bus::new(8, None);
-        #[cfg(not(feature = "bus-metrics"))]
-        let bus = Bus::new(8);
+    let bus = Bus::new(8);
         let h = bus.handle();
         struct S;
         struct A;

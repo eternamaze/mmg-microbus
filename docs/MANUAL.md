@@ -24,15 +24,22 @@ impl App {
     Ok(())
   }
 }
-
-mmg_microbus::easy_main!();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+  let mut app = mmg_microbus::prelude::App::new(Default::default());
+  app.add_component::<App>("app");
+  app.start().await?;
+  // ...
+  app.stop().await;
+  Ok(())
+}
 ```
 
 ## 方法即订阅（唯一路径）
 1) 标注组件：`#[component] struct S { id: ComponentId }`
 2) 写处理函数：`#[handles] impl S { async fn on_xxx(&mut self, ...T...) -> Result<()> }`
 3) 可选过滤：`#[handle(T, from=Kind, instance=MarkerType)]`（`MarkerType` 需实现 `InstanceMarker`）
-4) 启动：`mmg_microbus::easy_main!();`（内部调用 `App::run_until_ctrl_c()` 单一入口）
+4) 启动：自行提供 Tokio 入口，使用 `App::new + add_component::<T>(id) + start()/stop()` 进行生命周期控制。
 
 签名即语义：
 - 参数形态：`&T`
@@ -79,13 +86,12 @@ impl Trader {
 ```
 要点：主动源写自定义 `run`，消费方仍可用 `#[handles]` 订阅；这体现了“组件是一等公民，handlers 只是语法糖”的设计。
 
-## 配置即对象
+## 配置即对象（启动前一次性注入）
 - 使用 `#[configure(MyCfg)] + impl Configure<MyCfg>` 声明与实现配置处理。
-- `App.config(cfg)`：启动前注入；运行期支持热更（`pause→broadcast→barrier→resume`）。
+- `app.config(cfg)`：仅在启动前注入一次；运行期不支持热更新。
 
 示例：
 ```rust
-#[derive(serde::Serialize)]
 struct Cfg { queue_capacity: usize }
 app.config(Cfg { queue_capacity: 256 }).await?;
 ```
@@ -94,7 +100,7 @@ app.config(Cfg { queue_capacity: 256 }).await?;
 - 发送：阻塞直送（不丢包）；小型有界队列仅吸收调度抖动。
 - 清理：按需清理；检测到 `sender` 关闭即修剪。
 - 性能：单订阅快路径；`SmallVec` 降低 fanout 分配；最后一次 `move` 避免多余 `Arc` 克隆。
-- 指标：可选特性 `bus-metrics`；默认关闭为零热路径成本。
+ 
 
 ## 强类型路由与模式订阅
 - 唯一地址模型：`Address { service: Option<KindId>, instance: Option<ComponentId> }`
@@ -119,9 +125,7 @@ while let Some(tick) = sub.recv().await { /* use tick */ }
   - 目标：为方法声明处理的消息类型与（可选）来源过滤；`Marker` 为实现了 `InstanceMarker` 的零尺寸类型。
   - 备注：当方法签名无法推断 T 时必须显式写 `T`。
 - #[configure(T)]
-  - 目标：声明组件的配置处理；需配合实现 `Configure<T>`，框架会在启动与热更新时调用。
-- easy_main!
-  - 目标：生成 Tokio 入口并运行应用；后者会在启动前注入一次性初始配置。
+  - 目标：声明组件的配置处理；需配合实现 `Configure<T>`，框架会在启动时调用一次（不支持运行期热更新）。
 
 ## 故障排查
 - 没收到消息：

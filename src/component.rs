@@ -42,7 +42,6 @@ pub struct ComponentContext {
     pub self_addr: ServiceAddr,
     pub bus: BusHandle,
     pub shutdown: watch::Receiver<bool>,
-    pub config_rx: watch::Receiver<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ComponentContext {
@@ -51,7 +50,6 @@ impl ComponentContext {
         service: KindId,
         bus: BusHandle,
         shutdown: watch::Receiver<bool>,
-        config_rx: watch::Receiver<Arc<dyn Any + Send + Sync>>,
     ) -> Self {
         let self_addr = ServiceAddr {
             service,
@@ -62,7 +60,6 @@ impl ComponentContext {
             self_addr,
             bus,
             shutdown,
-            config_rx,
         }
     }
 
@@ -92,20 +89,7 @@ impl ComponentContext {
     }
     // 仅提供强类型通道（&T），不提供 Any 自动装配通道。
 
-    // -------- Config helpers --------
-    pub fn current_config_any(&self) -> Arc<dyn Any + Send + Sync> {
-        self.config_rx.borrow().clone()
-    }
-    pub fn current_config<T: 'static + Send + Sync>(&self) -> Option<Arc<T>> {
-        self.current_config_any().downcast::<T>().ok()
-    }
-    pub async fn wait_config_change(&mut self) -> Option<Arc<dyn Any + Send + Sync>> {
-        if self.config_rx.changed().await.is_ok() {
-            Some(self.config_rx.borrow().clone())
-        } else {
-            None
-        }
-    }
+    // 不再提供配置热更新辅助：配置仅在启动时一次性注入
 }
 
 // ---- 配置注入上下文与契约 ----
