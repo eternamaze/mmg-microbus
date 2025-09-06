@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 - 当签名无法推断时显式写 `#[handle(T)]`
 
 ## 组件是一等公民：主动消息源
-`#[handles]` 是语法糖，会为你的结构体自动生成 `Component::run` 并把消息分发到标注的方法，适合“被动响应”型组件。要实现“主动推送”的消息源（例如定时采集/轮询外部系统），请直接实现组件的 `run()`，在其中使用 `ctx.publish(...)` 主动向总线发消息，并监听 `ctx.shutdown` 以优雅退出。
+`#[handles]` 是语法糖，会为你的结构体自动生成 `Component::run` 并把消息分发到标注的方法，适合“被动响应”型组件。要实现“主动推送”的消息源（例如定时采集/轮询外部系统），请直接实现组件的 `run()`，在其中使用 `ctx.publish(...)` 主动向总线发消息；生命周期方面可使用“自动随停订阅/优雅睡眠”避免显式处理关停逻辑。
 
 最小示例：
 ```rust
@@ -66,7 +66,7 @@ impl mmg_microbus::component::Component for Feeder {
     loop {
       tokio::select! {
   _ = intv.tick() => { n += 1; ctx.publish(Tick(n)).await; }
-        changed = ctx.shutdown.changed() => { if changed.is_ok() { break; } else { break; } }
+  // 可选：若有等待场景，优先使用 ctx.graceful_sleep(..) 或 auto 订阅的 recv()
       }
     }
     Ok(())
@@ -84,16 +84,29 @@ impl Trader {
   }
 }
 ```
-要点：主动源写自定义 `run`，消费方仍可用 `#[handles]` 订阅；这体现了“组件是一等公民，handlers 只是语法糖”的设计。
+要点：
+- 主动源写自定义 `run`，消费方仍可用 `#[handles]` 订阅；这体现了“组件是一等公民，handlers 只是语法糖”的设计。
+- IoC 友好停机：若使用手写 `run`，可通过 `ctx.subscribe_*_auto()` 获取“自动随停订阅”，或用 `sub.recv_or_shutdown(&ctx.shutdown)`；也可用 `ctx.graceful_sleep(dur)` 在停机时提前返回，避免显式处理 `shutdown` 分支。
 
 ## 配置即对象（启动前一次性注入）
-- 使用 `#[configure(MyCfg)] + impl Configure<MyCfg>` 声明与实现配置处理。
-- `app.config(cfg)`：仅在启动前注入一次；运行期不支持热更新。
+- 在 handler 形参中直接声明 `&MyCfg` 即可自动注入配置对象。
+- 通过 `app.provide_config(MyCfg { ... }).await?` 在启动前注入一次；运行期不支持热更新。
 
 示例：
 ```rust
-struct Cfg { queue_capacity: usize }
-app.config(Cfg { queue_capacity: 256 }).await?;
+#[derive(Clone)]
+struct MyCfg { queue_capacity: usize }
+
+#[mmg_microbus::handles]
+impl Worker {
+  async fn on_tick(&mut self, _t: &Tick, cfg: &MyCfg) -> anyhow::Result<()> {
+    // 使用 cfg
+    Ok(())
+  }
+}
+
+let mut app = App::new(Default::default());
+app.provide_config(MyCfg { queue_capacity: 256 }).await?;
 ```
 
 ## 运行语义与性能
@@ -110,7 +123,8 @@ app.config(Cfg { queue_capacity: 256 }).await?;
 ```rust
 use mmg_microbus::bus::Address;
 let mut sub = ctx.subscribe_pattern::<Tick>(Address::for_kind::<Feeder>()).await;
-while let Some(tick) = sub.recv().await { /* use tick */ }
+let mut sub = ctx.subscribe_pattern_auto::<Tick>(Address::for_kind::<Feeder>()).await;
+while let Some(tick) = sub.recv().await { /* use tick; 自动随停 */ }
 ```
 
 ## 宏快速参考（用户可用）
@@ -124,14 +138,13 @@ while let Some(tick) = sub.recv().await { /* use tick */ }
 - #[handle(T, from=Kind, instance=Marker)]
   - 目标：为方法声明处理的消息类型与（可选）来源过滤；`Marker` 为实现了 `InstanceMarker` 的零尺寸类型。
   - 备注：当方法签名无法推断 T 时必须显式写 `T`。
-- #[configure(T)]
-  - 目标：声明组件的配置处理；需配合实现 `Configure<T>`，框架会在启动时调用一次（不支持运行期热更新）。
+// 配置注入无需宏；直接在方法签名以 `&CfgType` 声明即可。
 
 ## 故障排查
 - 没收到消息：
   - 方法参数需为 `&T`；必要时显式写 `#[handle(T)]`。
   - 检查过滤是否过严（from/instance）。
-- 配置未生效：确认已实现 `#[configure(T)]` 且类型匹配；运行期注入请用 `app.config`。
+- 配置未生效：确认在 handler 签名中使用 `&CfgType`，并已在启动前通过 `app.provide_config(CfgType { .. })` 注入。
 
 ## 边界（刻意不做）
 - 同进程强类型总线；不含网络/跨进程。

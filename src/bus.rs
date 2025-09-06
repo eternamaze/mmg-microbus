@@ -10,7 +10,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::Arc,
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, watch};
 //
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -118,6 +118,21 @@ pub struct Subscription<T> {
 impl<T> Subscription<T> {
     pub async fn recv(&mut self) -> Option<Arc<T>> {
         self.rx.recv().await
+    }
+    /// Receive next message or end on shutdown. When the shutdown receiver signals, returns None.
+    pub async fn recv_or_shutdown(
+        &mut self,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Option<Arc<T>> {
+        let mut sd = shutdown.clone();
+        tokio::select! {
+            _ = sd.changed() => {
+                None
+            }
+            msg = self.rx.recv() => {
+                msg
+            }
+        }
     }
 }
 

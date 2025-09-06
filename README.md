@@ -34,8 +34,9 @@ async fn main() -> anyhow::Result<()> {
 使用要点
 - 默认参数形态：`&T`；可按需注入 `&ComponentContext`。
 - 过滤注解：使用类型标记 `#[handle(T, from=ServiceType, instance=MarkerType)]`（`MarkerType` 必须实现 `InstanceMarker`）。
-- 配置注入：`#[configure(MyCfg)] + impl Configure<MyCfg>`；启动前通过 `app.config(AggregateCfg { .. })` 一次性注入（不支持热更新，无需序列化/反序列化）。
+- 配置注入：在 handler 形参中直接声明 `&MyCfg`；启动前通过 `app.provide_config(MyCfg { .. }).await?` 一次性注入（运行期不支持热更新，无需序列化/反序列化）。
 - 运行语义：阻塞直送不丢包；按需清理，无周期扫描；单订阅快路径与小向量优化。
+ - 生命周期：由 `App` 统一启停；手写 `run` 可用 `ctx.subscribe_*_auto()` 获取“自动随停订阅”，或 `sub.recv_or_shutdown(&ctx.shutdown)`；也可用 `ctx.graceful_sleep(dur)` 简化退出处理。
 
 推荐默认路径（面向使用者的一致心智）
 - 发布：在 handler 中通过 `ComponentContext::publish(msg)`；外部通过 `App::bus_handle().publish(Address::of_instance::<S, I>(), msg)`。

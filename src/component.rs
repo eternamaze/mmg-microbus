@@ -96,6 +96,22 @@ impl ComponentContext {
     ) -> crate::bus::Subscription<T> {
         self.bus.subscribe_pattern::<T>(pattern).await
     }
+    /// Subscribe and get an auto-shutdown subscription: recv will end when App stops.
+    pub async fn subscribe_from_auto<T: Send + Sync + 'static>(
+        &self,
+        from: &Address,
+    ) -> AutoSubscription<T> {
+        let sub = self.bus.subscribe::<T>(from).await;
+        AutoSubscription { inner: sub, shutdown: self.shutdown.clone() }
+    }
+    /// Pattern subscribe with auto-shutdown behavior.
+    pub async fn subscribe_pattern_auto<T: Send + Sync + 'static>(
+        &self,
+        pattern: Address,
+    ) -> AutoSubscription<T> {
+        let sub = self.bus.subscribe_pattern::<T>(pattern).await;
+        AutoSubscription { inner: sub, shutdown: self.shutdown.clone() }
+    }
     pub async fn publish<T: Send + Sync + 'static>(&self, msg: T) {
         let me = Address {
             service: Some(self.self_addr.service),
@@ -113,3 +129,25 @@ impl ComponentContext {
 
 // ---- 配置注入上下文与契约 ----
 // 取消旧的配置回调契约：改为在 handler 签名中通过 &ConfigType 参数进行注入
+
+/// A subscription wrapper that automatically treats App shutdown as stream end.
+pub struct AutoSubscription<T> {
+    inner: crate::bus::Subscription<T>,
+    shutdown: watch::Receiver<bool>,
+}
+impl<T> AutoSubscription<T> {
+    pub async fn recv(&mut self) -> Option<std::sync::Arc<T>> {
+        self.inner.recv_or_shutdown(&self.shutdown).await
+    }
+}
+
+impl ComponentContext {
+    /// Sleep with graceful shutdown: returns early when shutdown is signaled.
+    pub async fn graceful_sleep(&self, dur: std::time::Duration) {
+        let mut sd = self.shutdown.clone();
+        tokio::select! {
+            _ = sd.changed() => {}
+            _ = tokio::time::sleep(dur) => {}
+        }
+    }
+}
