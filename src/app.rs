@@ -3,7 +3,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     bus::{Bus, BusHandle},
-    component::ComponentContext,
+    component::{ComponentContext, ConfigStore},
     config::{AppConfig, ComponentConfig},
 };
 
@@ -14,13 +14,14 @@ pub struct App {
     started: bool,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_linger: std::time::Duration,
-    // initial typed config blob (project-wide aggregate struct)
-    init_cfg_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    // 启动前暂存的配置条目（类型 -> Arc<T>），启动时冻结为只读 ConfigStore
+    cfg_map: std::collections::HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    frozen_cfg: Option<ConfigStore>,
 }
 
 impl App {
     pub fn new(cfg: AppConfig) -> Self {
-    let bus = Bus::new(cfg.queue_capacity);
+        let bus = Bus::new(cfg.queue_capacity);
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let linger = std::time::Duration::from_millis(cfg.shutdown_linger_ms);
         Self {
@@ -30,7 +31,8 @@ impl App {
             started: false,
             shutdown_tx: tx,
             shutdown_linger: linger,
-            init_cfg_any: None,
+            cfg_map: std::collections::HashMap::new(),
+            frozen_cfg: None,
         }
     }
 
@@ -41,17 +43,15 @@ impl App {
         self
     }
 
-    /// 强类型配置入口（仅启动前一次性注入）。
-    /// - 启动前调用：作为初始配置，在 start() 时注入到每个组件。
-    /// - 已启动后调用将返回错误（不支持热更新）。
-    pub async fn config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
-        let v: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(cfg);
+    /// 注入一个类型化配置条目；可多次调用以注入多种配置类型。
+    /// - 仅在启动前允许；启动时将冻结为只读的 ConfigStore。
+    pub async fn provide_config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
+        use std::any::TypeId;
         if self.started {
-            return Err(anyhow::anyhow!(
-                "App already started; runtime config updates are not supported"
-            ));
+            return Err(anyhow::anyhow!("App already started; runtime config updates are not supported"));
         }
-        self.init_cfg_any = Some(v);
+        let entry = std::sync::Arc::new(cfg) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
+        self.cfg_map.insert(TypeId::of::<T>(), entry);
         Ok(self)
     }
     pub async fn start(&mut self) -> Result<()> {
@@ -64,19 +64,19 @@ impl App {
                 "no components configured; please provide AppConfig.components explicitly"
             ));
         }
-
-        // 预构建工厂表：type_name -> factory
+        // 冻结配置存储
+        let cfg_store = if let Some(f) = self.frozen_cfg.clone() { f } else {
+            let frozen = ConfigStore::from_frozen_map(self.cfg_map.clone());
+            self.frozen_cfg = Some(frozen.clone());
+            frozen
+        };
+        // 预构建工厂表：KindId -> factory
         let mut factories: std::collections::HashMap<crate::bus::KindId, std::sync::Arc<dyn crate::component::ComponentFactory>> = std::collections::HashMap::new();
         for e in inventory::iter::<crate::registry::FactoryEntry> {
             let f = (e.0)();
             factories.entry(f.kind_id()).or_insert(f);
         }
         let handle = self.bus.handle();
-        // 启动时的初始配置（若无则使用空占位 Arc<()> ）
-        let init_any = self
-            .init_cfg_any
-            .clone()
-            .unwrap_or_else(|| std::sync::Arc::new(()));
         for cc in self.cfg.components.iter() {
             // 查表匹配配置的 kind（KindId）
             let factory = match factories.get(&cc.kind) {
@@ -85,35 +85,23 @@ impl App {
             };
             let id = cc.id.clone();
             let bus_handle = handle.clone();
-            // ComponentConfig no longer carries JSON params; typed config flows via App::config(T)
             let kind_id = factory.kind_id();
             let rx = self.shutdown_tx.subscribe();
-            let init_any_i = init_any.clone();
+            let cfg_store_i = cfg_store.clone();
             let fut = async move {
                 let built = factory
                     .build(crate::bus::ComponentId(id.clone()), bus_handle.clone())
                     .await;
                 match built {
-                    Ok(mut comp) => {
-                        // Use type-based service kind for routing clarity
+                    Ok(comp) => {
                         let ctx = ComponentContext::new_with_service(
                             crate::bus::ComponentId(id.clone()),
                             kind_id,
                             bus_handle.clone(),
                             rx.clone(),
+                            cfg_store_i.clone(),
                         );
-                        // 启动时进行一次配置应用（若注册了 #[configure(T)]）
-                        let cfg_ctx = crate::component::ConfigContext::new(
-                            crate::bus::ComponentId(id.clone()),
-                            kind_id,
-                        );
-                        for ce in inventory::iter::<crate::config_registry::DesiredCfgEntry> {
-                            if (ce.0.component_kind)() == kind_id {
-                                let _ = (ce.0.invoke)(&mut *comp, cfg_ctx.clone(), init_any_i.clone()).await;
-                            }
-                        }
-                        
-                        // 运行组件
+                        // 运行组件（组件通过参数注入获取上下文、消息与配置）
                         if let Err(e) = comp.run(ctx).await {
                             tracing::error!(component = %id, kind = %factory.type_name(), error = %e, "component exited with error");
                         }

@@ -1,6 +1,6 @@
 use crate::bus::{Address, BusHandle, ComponentId, KindId, ServiceAddr};
 use async_trait::async_trait;
-use std::{any::Any, fmt, sync::Arc};
+use std::{any::{Any, TypeId}, fmt, sync::Arc, collections::HashMap};
 use tokio::sync::watch;
 
 // 已由 bus.rs 定义强类型 ComponentId
@@ -37,11 +37,28 @@ impl fmt::Debug for dyn ComponentFactory {
 
 pub type DynFactory = Arc<dyn ComponentFactory>;
 
+// 只读配置存储：在 App::start 时冻结，运行期只读访问
+#[derive(Clone)]
+pub struct ConfigStore {
+    inner: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+}
+impl ConfigStore {
+    pub fn empty() -> Self { Self { inner: Arc::new(HashMap::new()) } }
+    pub fn from_frozen_map(map: HashMap<TypeId, Arc<dyn Any + Send + Sync>>) -> Self {
+        Self { inner: Arc::new(map) }
+    }
+    pub fn get<T: 'static + Send + Sync>(&self) -> Option<Arc<T>> {
+        let tid = TypeId::of::<T>();
+        self.inner.get(&tid).and_then(|v| v.clone().downcast::<T>().ok())
+    }
+}
+
 pub struct ComponentContext {
     pub id: crate::bus::ComponentId,
     pub self_addr: ServiceAddr,
     pub bus: BusHandle,
     pub shutdown: watch::Receiver<bool>,
+    pub cfg: ConfigStore,
 }
 
 impl ComponentContext {
@@ -50,6 +67,7 @@ impl ComponentContext {
         service: KindId,
         bus: BusHandle,
         shutdown: watch::Receiver<bool>,
+        cfg: ConfigStore,
     ) -> Self {
         let self_addr = ServiceAddr {
             service,
@@ -60,6 +78,7 @@ impl ComponentContext {
             self_addr,
             bus,
             shutdown,
+            cfg,
         }
     }
 
@@ -89,40 +108,8 @@ impl ComponentContext {
     }
     // 仅提供强类型通道（&T），不提供 Any 自动装配通道。
 
-    // 不再提供配置热更新辅助：配置仅在启动时一次性注入
+    // 不再提供配置热更新：配置仅在启动时一次性注入
 }
 
 // ---- 配置注入上下文与契约 ----
-#[derive(Clone)]
-pub struct ConfigContext {
-    pub id: ComponentId,
-    pub self_addr: ServiceAddr,
-}
-impl ConfigContext {
-    pub fn new(id: ComponentId, service: KindId) -> Self {
-        let self_addr = ServiceAddr {
-            service,
-            instance: id.clone(),
-        };
-        Self { id, self_addr }
-    }
-    pub fn from_component_ctx(c: &ComponentContext) -> Self {
-        Self {
-            id: c.id.clone(),
-            self_addr: c.self_addr.clone(),
-        }
-    }
-}
-
-#[async_trait]
-pub trait Configure<C>: Send + Sync {
-    async fn on_config(&mut self, ctx: &ConfigContext, cfg: C) -> anyhow::Result<()>;
-}
-
-pub trait ConfigApplyDyn {
-    fn apply<'a>(
-        &'a mut self,
-        ctx: ConfigContext,
-        v: Arc<dyn Any + Send + Sync>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
-}
+// 取消旧的配置回调契约：改为在 handler 签名中通过 &ConfigType 参数进行注入

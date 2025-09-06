@@ -86,51 +86,7 @@ pub fn component(_args: TokenStream, input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-// 标注一个实现块为“配置处理函数”，类型参数是配置结构体 T。
-// 要求实现 `Configure<T>` trait（在运行库中），宏只做注册工作，使框架可自动发现并在启动/热更时调用。
-#[proc_macro_attribute]
-pub fn configure(args: TokenStream, input: TokenStream) -> TokenStream {
-    let ty: Type = parse_macro_input!(args as Type);
-    let item = parse_macro_input!(input as ItemImpl);
-    let self_ty = &item.self_ty;
-    let expanded = quote! {
-        #item
-        #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
-        const _: () = {
-            fn __kind() -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#self_ty>() }
-            impl mmg_microbus::component::ConfigApplyDyn for #self_ty {
-                fn apply<'a>(
-                    &'a mut self,
-                    ctx: mmg_microbus::component::ConfigContext,
-                    v: std::sync::Arc<dyn std::any::Any + Send + Sync>,
-                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-                    Box::pin(async move {
-                        if let Ok(v) = v.downcast::<#ty>() {
-                            <Self as mmg_microbus::component::Configure<#ty>>::on_config(self, &ctx, (*v).clone()).await
-                        } else {
-                            // 若类型不匹配，静默忽略（允许同一聚合配置里不存在该类型）
-                            Ok(())
-                        }
-                    })
-                }
-            }
-            fn __invoke<'a>(
-                comp: &'a mut dyn mmg_microbus::component::Component,
-                ctx: mmg_microbus::component::ConfigContext,
-                v: std::sync::Arc<dyn std::any::Any + Send + Sync>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-                if let Some(c) = comp.as_any_mut().downcast_mut::<#self_ty>() {
-                    mmg_microbus::component::ConfigApplyDyn::apply(c, ctx, v)
-                } else {
-                    Box::pin(async { Ok(()) })
-                }
-            }
-            mmg_microbus::inventory::submit! { mmg_microbus::config_registry::DesiredCfgEntry(mmg_microbus::config_registry::DesiredCfgSpec { component_kind: __kind, invoke: __invoke }) }
-        };
-    };
-    expanded.into()
-}
+// 移除旧的 #[configure] 宏：配置改为在 handler 签名中以 &CfgType 参数注入
 
 // --- 方法即订阅（强类型，&T-only） ---
 // 用法：
@@ -232,6 +188,7 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
         ident: syn::Ident,
         msg_ty: Type,
         wants_ctx: bool,
+        cfg_param_tys: Vec<Type>,
         pattern_tokens: proc_macro2::TokenStream,
     }
 
@@ -283,9 +240,10 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                 }
             }
 
-            // 解析参数：可选注入 &ComponentContext；消息参数必须是 &T
+            // 解析参数：可选注入 &ComponentContext；消息参数必须是 &T；其余 &CfgType 作为配置注入
             let mut wants_ctx = false;
             let mut msg: Option<Type> = None;
+            let mut cfg_param_tys: Vec<Type> = Vec::new();
             for arg in &m.sig.inputs {
                 if let syn::FnArg::Typed(pat_ty) = arg {
                     if is_ctx_type(&pat_ty.ty) {
@@ -294,6 +252,10 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                     }
                     if msg.is_none() {
                         msg = parse_msg_arg_ref(&pat_ty.ty);
+                        if msg.is_some() { continue; }
+                    }
+                    if let Some(t) = parse_msg_arg_ref(&pat_ty.ty) {
+                        cfg_param_tys.push(t);
                     }
                 }
             }
@@ -335,6 +297,7 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                 ident: m.sig.ident.clone(),
                 msg_ty,
                 wants_ctx,
+                cfg_param_tys,
                 pattern_tokens,
             });
         }
@@ -353,14 +316,28 @@ pub fn handles(_args: TokenStream, input: TokenStream) -> TokenStream {
                 .subscribe_pattern::<#ty>(#pattern)
                 .await;
         });
-        let call = if ms.wants_ctx {
-            quote! { this.#method_ident(&ctx, &*env).await }
+        // 生成配置注入绑定与调用表达式
+        let mut __cfg_bind = Vec::new();
+        let mut __cfg_args = Vec::new();
+    for (ci, cty) in ms.cfg_param_tys.iter().enumerate() {
+            let var = format_ident!("__cfg_{}_{}", idx, ci);
+            __cfg_bind.push(quote! {
+        let #var = match ctx.cfg.get::<#cty>() { Some(v) => v, None => {
+            let __ty: &str = std::any::type_name::<#cty>();
+            tracing::error!("missing config: {}", __ty);
+            continue; } };
+            });
+            __cfg_args.push(quote! { &*#var });
+        }
+        let call_expr = if ms.wants_ctx {
+            quote! { this.#method_ident(&ctx, &*env, #(#__cfg_args),*).await }
         } else {
-            quote! { this.#method_ident(&*env).await }
+            quote! { this.#method_ident(&*env, #(#__cfg_args),*).await }
         };
         select_arms.push(quote! {
             Some(env) = #sub_var.recv() => {
-                if let Err(e) = #call { tracing::warn!(method = stringify!(#method_ident), error = ?e, "handler returned error"); }
+                #(#__cfg_bind)*
+                if let Err(e) = { #call_expr } { tracing::warn!(method = stringify!(#method_ident), error = ?e, "handler returned error"); }
             }
         });
     }

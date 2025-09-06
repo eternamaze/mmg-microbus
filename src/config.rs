@@ -28,4 +28,4 @@ pub struct ComponentConfig {
     pub kind: KindId,
 }
 
-// 配置结构体仅负责运行参数，不声明订阅或拓扑。
+// 配置结构体仅负责运行参数；业务配置以类型注入方式在 handler 签名中获取。
