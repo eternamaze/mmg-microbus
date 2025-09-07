@@ -74,3 +74,41 @@ async fn method_based_subscription_works() {
 
     app.stop().await;
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Stopped(&'static str);
+
+#[mmg_microbus::component]
+struct Stoppable {
+    id: mmg_microbus::bus::ComponentId,
+}
+
+#[mmg_microbus::component]
+impl Stoppable {
+    #[mmg_microbus::stop]
+    async fn on_stop(&self) -> Stopped {
+        Stopped("bye")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_hook_is_invoked_and_can_publish() {
+    let mut app = App::new(Default::default());
+    app.add_component::<Stoppable>("s1");
+
+    // 订阅 stop 消息
+    let h = app.bus_handle();
+    let mut sub = h
+        .subscribe_pattern::<Stopped>(mmg_microbus::bus::Address::for_kind::<Stoppable>())
+        .await;
+
+    app.start().await.unwrap();
+    // 停机应触发 #[stop]，发布 Stopped
+    app.stop().await;
+    let got = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
+        .await
+        .ok()
+        .flatten()
+        .expect("no Stopped received");
+    assert_eq!(&*got, &Stopped("bye"));
+}

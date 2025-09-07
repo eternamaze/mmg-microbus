@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::any::{Any, TypeId};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -14,13 +15,18 @@ pub struct App {
     started: bool,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_linger: std::time::Duration,
-    factories: std::collections::HashMap<crate::bus::KindId, std::sync::Arc<dyn crate::component::ComponentFactory>>,
+    factories: std::collections::HashMap<
+        crate::bus::KindId,
+        std::sync::Arc<dyn crate::component::ComponentFactory>,
+    >,
     // 启动前暂存的配置条目（类型 -> Arc<T>），启动时冻结为只读 ConfigStore
     cfg_map: std::collections::HashMap<
         std::any::TypeId,
         std::sync::Arc<dyn std::any::Any + Send + Sync>,
     >,
     frozen_cfg: Option<ConfigStore>,
+    // 记录框架配置是否已设置过，用于重复设置时发出覆盖警告
+    app_cfg_set: bool,
 }
 
 impl App {
@@ -38,6 +44,7 @@ impl App {
             factories: std::collections::HashMap::new(),
             cfg_map: std::collections::HashMap::new(),
             frozen_cfg: None,
+            app_cfg_set: false,
         }
     }
 
@@ -48,8 +55,7 @@ impl App {
     ) -> &mut Self {
         let kind = <T as RegisteredComponent>::kind_id();
         // 注册工厂（若未注册）
-        self
-            .factories
+        self.factories
             .entry(kind)
             .or_insert_with(|| <T as RegisteredComponent>::factory());
         self.cfg.components.push(ComponentConfig {
@@ -59,18 +65,70 @@ impl App {
         self
     }
 
-    /// 注入一个类型化配置条目；可多次调用以注入多种配置类型。
-    /// - 仅在启动前允许；启动时将冻结为只读的 ConfigStore。
-    pub async fn provide_config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
-        use std::any::TypeId;
+    /// 配置入口（单项）：
+    /// - 传入任意业务配置类型，按类型存入只读配置仓库，供 #[init] 形参按 &T 自动注入。
+    /// - 传入框架配置类型（如 AppConfig）会被框架消费并应用到 App 本身，不进入业务配置仓库。
+    /// - 可多次调用以注入多种类型。
+    /// - 仅在启动前允许；启动后不支持动态更新。
+    pub async fn config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
+        // 启动后禁止配置：忽略并发出警告
         if self.started {
-            return Err(anyhow::anyhow!(
-                "App already started; runtime config updates are not supported"
-            ));
+            tracing::warn!(config_type = %std::any::type_name::<T>(), "config called after start(); ignoring");
+            return Ok(self);
         }
-        let entry = std::sync::Arc::new(cfg) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
-        self.cfg_map.insert(TypeId::of::<T>(), entry);
+        if TypeId::of::<T>() == TypeId::of::<AppConfig>() {
+            let any_box: Box<dyn Any + Send + Sync> = Box::new(cfg);
+            match any_box.downcast::<AppConfig>() {
+                Ok(b) => {
+                    if self.app_cfg_set {
+                        tracing::warn!("AppConfig provided multiple times before start; overriding previous values");
+                    }
+                    self.app_cfg_set = true;
+                    self.apply_app_config(*b);
+                }
+                Err(_) => {
+                    debug_assert!(false, "TypeId matched AppConfig but downcast failed");
+                    return Ok(self);
+                }
+            }
+        } else {
+            let tid = TypeId::of::<T>();
+            if self.cfg_map.contains_key(&tid) {
+                tracing::warn!(config_type = %std::any::type_name::<T>(), "config for this type provided multiple times before start; overriding");
+            }
+            let entry = std::sync::Arc::new(cfg) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
+            self.cfg_map.insert(tid, entry);
+        }
         Ok(self)
+    }
+    /// 批量配置入口（闭包）：仅为 `config` 的薄包装器，调用方提供一个异步闭包，内部按序调用 `self.config(...)`。
+    /// 示例：
+    /// app.config_many(|a| async {
+    ///     a.config(CfgA{..}).await?;
+    ///     a.config(CfgB{..}).await
+    /// }).await?;
+    pub async fn config_many<F>(&mut self, f: F) -> Result<&mut Self>
+    where
+        F: for<'a> FnOnce(
+            &'a mut App,
+        ) -> core::pin::Pin<
+            Box<dyn core::future::Future<Output = Result<()>> + Send + 'a>,
+        >,
+    {
+        if self.started {
+            tracing::warn!("config_many called after start(); ignoring all provided configs");
+            return Ok(self);
+        }
+        f(self).await?;
+        Ok(self)
+    }
+
+    fn apply_app_config(&mut self, cfg: AppConfig) {
+        // 合并策略：直接覆盖为最新值（队列容量/停机等待/组件列表）。
+        // 组件列表通常通过 add_component 维护；如通过 AppConfig 提供，也予以接纳。
+        self.cfg = cfg.clone();
+        self.bus = Bus::new(self.cfg.queue_capacity);
+        self.shutdown_linger = std::time::Duration::from_millis(self.cfg.shutdown_linger_ms);
     }
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
@@ -90,7 +148,7 @@ impl App {
             self.frozen_cfg = Some(frozen.clone());
             frozen
         };
-    // 工厂表来自 add_component 阶段登记的 KindId -> Factory
+        // 工厂表来自 add_component 阶段登记的 KindId -> Factory
 
         // 校验路由约束：凡 handler 声明 from=Kind 且未指明 instance，要求系统中该 kind 只有一个实例
         let mut instance_count: std::collections::HashMap<crate::bus::KindId, usize> =
@@ -107,6 +165,8 @@ impl App {
                 return Err(anyhow::anyhow!("route constraint failed: {} expects singleton of kind {:?}, but {} instances configured; specify instance in #[handle(.., instance=..)]", (rc.consumer_ty)(), (rc.from_kind)(), n));
             }
         }
+        // 放宽静态检查：不再强制“所有订阅类型必须存在发布者”。
+
         let handle = self.bus.handle();
         for cc in self.cfg.components.iter() {
             // 查表匹配配置的 kind（KindId）
@@ -154,12 +214,11 @@ impl App {
     }
     pub async fn stop(&mut self) {
         let _ = self.shutdown_tx.send(true);
-        let linger = self.shutdown_linger;
-        if linger > std::time::Duration::from_millis(0) {
-            tokio::time::sleep(linger).await;
-        }
-        for h in self.tasks.drain(..) {
-            h.abort();
+        // 等待所有组件任务自然退出（组件应响应 shutdown 信号或在 run 中 break）
+        let mut rest = Vec::new();
+        rest.append(&mut self.tasks);
+        for h in rest.into_iter() {
+            let _ = h.await; // 忽略错误（如任务自行返回 Err）
         }
         self.started = false;
     }
@@ -174,3 +233,5 @@ impl App {
         self
     }
 }
+
+// tests are covered in integration suite; unit tests omitted here

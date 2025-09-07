@@ -274,11 +274,15 @@ impl BusHandle {
             if let Some(list) = patterns.get(&type_id) {
                 let mut all = Vec::new();
                 for entry in list {
-                    let pt = entry
-                        .downcast_ref::<PatternTopic<T>>()
-                        .unwrap_or_else(|| panic!("type mismatch in pattern list for this type"));
-                    if pt.pattern.matches(from) {
-                        all.extend(pt.txs.iter().cloned());
+                    if let Some(pt) = entry.downcast_ref::<PatternTopic<T>>() {
+                        if pt.pattern.matches(from) {
+                            all.extend(pt.txs.iter().cloned());
+                        }
+                    } else {
+                        tracing::error!(
+                            "type mismatch in pattern list for this type; skipping entry"
+                        );
+                        continue;
                     }
                 }
                 all

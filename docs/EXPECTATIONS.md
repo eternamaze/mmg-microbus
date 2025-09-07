@@ -15,7 +15,7 @@
 - 函数参数形态：
   - `&T` 表示订阅消息类型 T（强类型订阅）。
   - 可选 `&ComponentContext` 注入运行上下文（发布、睡眠、ticker、spawn 等）。
-  - 可选 `&CfgType` 注入强类型配置（启动前通过 `App::provide_config(CfgType { .. })` 注入；运行期只读）。
+  - 配置注入仅在 `#[init]` 中通过形参 `&CfgType` 获取；启动前通过 `App::config(CfgType { .. })` 注入；运行期只读并由组件状态持有。
 - 返回值：
   - `()` 或 `Result<()>` 仅表示完成/错误。
   - `T` 或 `Result<T>` 将被自动发布为消息 T。

@@ -3,7 +3,7 @@
 //! - 统一注解模型（#[component]/#[handle]/#[active]）
 //! - 主动函数（#[active]）与被动订阅（#[handle]）
 //! - 过滤（from=ServiceType, instance=MarkerType）
-//! - 强类型配置（app.provide_config，handler 以 &Cfg 注入）
+//! - 强类型配置（app.config，#[init] 以 &Cfg 注入）
 
 use mmg_microbus::prelude::*;
 
@@ -15,11 +15,8 @@ struct Price(pub f64);
 
 // ---- 强类型配置 ----
 #[derive(Clone)]
-struct SymbolCfg {
+struct TraderCfg {
     symbol: String,
-}
-#[derive(Clone)]
-struct TickCfg {
     min_tick: u64,
 }
 
@@ -40,23 +37,30 @@ impl Feeder {
     }
 }
 
-// ---- 被动订阅组件：演示上下文、过滤与多配置注入 ----
+// ---- 被动订阅组件：演示上下文、过滤与配置注入 ----
 #[mmg_microbus::component]
 struct Trader {
     id: mmg_microbus::bus::ComponentId,
+    cfg: Option<TraderCfg>,
 }
 
 #[mmg_microbus::component]
 impl Trader {
-    // 订阅来自 Feeder 的 Tick；注入 &ComponentContext、&Tick、&TickCfg
+    // 初始化阶段读取配置并保存到组件状态
+    #[mmg_microbus::init]
+    async fn setup(&mut self, cfg: &TraderCfg) -> anyhow::Result<()> {
+        self.cfg = Some(cfg.clone());
+        Ok(())
+    }
+    // 订阅来自 Feeder 的 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态）
     #[mmg_microbus::handle(Tick, from=Feeder)]
     async fn on_tick(
         &mut self,
         ctx: &mmg_microbus::component::ComponentContext,
         tick: &Tick,
-        tcfg: &TickCfg,
     ) -> anyhow::Result<()> {
-        if tcfg.min_tick == 0 || tick.0 % tcfg.min_tick == 0 {
+        let min_tick = self.cfg.as_ref().map(|c| c.min_tick).unwrap_or(0);
+        if min_tick == 0 || tick.0 % min_tick == 0 {
             // 将 Tick 转换成 Price，并以 Exchange::Binance 身份发布
             let from = mmg_microbus::bus::Address::of_instance::<Exchange, Binance>();
             ctx.publish_from(&from, Price(tick.0 as f64)).await;
@@ -66,8 +70,9 @@ impl Trader {
 
     // 只接收来自 Exchange::Binance 的价格；注入 &Price 与 &SymbolCfg
     #[mmg_microbus::handle(Price, from=Exchange, instance=Binance)]
-    async fn on_price_binance(&mut self, price: &Price, scfg: &SymbolCfg) -> anyhow::Result<()> {
-        tracing::info!(target = "example.all", symbol = %scfg.symbol, price = price.0);
+    async fn on_price_binance(&mut self, price: &Price) -> anyhow::Result<()> {
+        let symbol = self.cfg.as_ref().map(|c| c.symbol.as_str()).unwrap_or("");
+        tracing::info!(target = "example.all", symbol = %symbol, price = price.0);
         Ok(())
     }
 
@@ -96,11 +101,11 @@ async fn main() -> anyhow::Result<()> {
     app.add_component::<Feeder>("feeder-1");
     app.add_component::<Trader>("trader-1");
     // 注入强类型配置（可多项）
-    app.provide_config(SymbolCfg {
+    app.config(TraderCfg {
         symbol: "BTCUSDT".into(),
+        min_tick: 2,
     })
     .await?;
-    app.provide_config(TickCfg { min_tick: 2 }).await?;
 
     app.start().await?;
 

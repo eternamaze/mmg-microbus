@@ -16,7 +16,8 @@ struct App { id: mmg_microbus::bus::ComponentId }
 impl App {
   #[mmg_microbus::handle(Tick)]
   async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
-  println!("tick {}", tick.0); Ok(())
+  println!("tick {}", tick.0);
+  Ok(())
   }
 }
 #[tokio::main(flavor = "multi_thread")]
@@ -30,12 +31,12 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-完整示例：见 `examples/all_in_one.rs`（来源过滤、实例约束、主动/被动函数、配置注入与自发布）。
+完整示例：见 `examples/all_in_one.rs`（来源过滤、实例约束、主动/被动函数、通过 #[init] 注入配置与外部发布）。
 
 使用要点
 - 默认参数形态：`&T`；可按需注入 `&ComponentContext`。
 - 过滤注解：使用类型标记 `#[handle(T, from=ServiceType, instance=MarkerType)]`（`MarkerType` 必须实现 `InstanceMarker`）。
-- 配置注入：在 handler 形参中直接声明 `&MyCfg`；启动前通过 `app.provide_config(MyCfg { .. }).await?` 一次性注入（运行期不支持热更新，无需序列化/反序列化）。
+- 配置注入：仅在 `#[init]` 形参中声明 `&MyCfg`；启动前通过 `app.config(MyCfg { .. }).await?` 一次性注入（运行期不支持热更新）。
 - 运行语义：阻塞直送不丢包；按需清理，无周期扫描；单订阅快路径与小向量优化。
 - 生命周期：由 `App` 统一启停；通常无需手写 `run`。主动函数使用 `#[active(..)]`，被动函数使用 `#[handle(..)]`，返回值自动发布。
 
@@ -58,3 +59,13 @@ API 要点（单一路径）
 
 许可证
 - MIT
+
+附注（框架要点）
+- 注解驱动：`#[component]`/`#[handle]`/`#[active]`/`#[init]`/`#[stop]`。
+- 私有组件抽象：App 以 `KindId + Factory` 管理组件生命周期，与业务类型解耦。
+- 单函数单订阅：一个 `#[handle]` 方法只订阅一个消息类型。
+- 配线检查放宽：允许订阅消息在运行期没有生产者。
+
+更多参见：
+- docs/MANUAL.md（权威手册）
+- docs/EXPECTATIONS.md（设计期望与使用规范）

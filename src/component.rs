@@ -149,8 +149,8 @@ impl ComponentContext {
     }
 }
 
-// ---- 配置注入上下文与契约 ----
-// 取消旧的配置回调契约：改为在 handler 签名中通过 &ConfigType 参数进行注入
+// ---- 配置注入说明 ----
+// 配置仅在 #[init] 中通过 &CfgType 注入一次；运行时只读，由组件状态自行持有与使用。
 
 /// A subscription wrapper that automatically treats App shutdown as stream end.
 pub struct AutoSubscription<T> {
