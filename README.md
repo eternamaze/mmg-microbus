@@ -14,6 +14,7 @@ struct App { id: mmg_microbus::bus::ComponentId }
 
 #[mmg_microbus::component]
 impl App {
+  #[mmg_microbus::handle(Tick)]
   async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
   println!("tick {}", tick.0); Ok(())
   }

@@ -42,6 +42,19 @@ impl fmt::Debug for dyn ComponentFactory {
 
 pub type DynFactory = Arc<dyn ComponentFactory>;
 
+/// Marker trait implemented by #[component] structs to expose their factory without global scanning.
+pub trait RegisteredComponent {
+    fn kind_id() -> KindId
+    where
+        Self: Sized;
+    fn type_name() -> &'static str
+    where
+        Self: Sized;
+    fn factory() -> DynFactory
+    where
+        Self: Sized;
+}
+
 // 只读配置存储：在 App::start 时冻结，运行期只读访问
 #[derive(Clone)]
 pub struct ConfigStore {

@@ -3,7 +3,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     bus::{Bus, BusHandle},
-    component::{ComponentContext, ConfigStore},
+    component::{ComponentContext, ConfigStore, RegisteredComponent},
     config::{AppConfig, ComponentConfig},
 };
 
@@ -14,6 +14,7 @@ pub struct App {
     started: bool,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_linger: std::time::Duration,
+    factories: std::collections::HashMap<crate::bus::KindId, std::sync::Arc<dyn crate::component::ComponentFactory>>,
     // 启动前暂存的配置条目（类型 -> Arc<T>），启动时冻结为只读 ConfigStore
     cfg_map: std::collections::HashMap<
         std::any::TypeId,
@@ -34,14 +35,23 @@ impl App {
             started: false,
             shutdown_tx: tx,
             shutdown_linger: linger,
+            factories: std::collections::HashMap::new(),
             cfg_map: std::collections::HashMap::new(),
             frozen_cfg: None,
         }
     }
 
-    /// 以类型安全的方式注册组件实例，避免外部硬编码类型名字符串。
-    pub fn add_component<T: 'static>(&mut self, id: impl Into<String>) -> &mut Self {
-        let kind = crate::bus::KindId::of::<T>();
+    /// 以类型安全的方式注册组件实例并登记其工厂，避免外部硬编码类型名字符串。
+    pub fn add_component<T: RegisteredComponent + 'static>(
+        &mut self,
+        id: impl Into<String>,
+    ) -> &mut Self {
+        let kind = <T as RegisteredComponent>::kind_id();
+        // 注册工厂（若未注册）
+        self
+            .factories
+            .entry(kind)
+            .or_insert_with(|| <T as RegisteredComponent>::factory());
         self.cfg.components.push(ComponentConfig {
             id: id.into(),
             kind,
@@ -66,26 +76,11 @@ impl App {
         if self.started {
             return Ok(());
         }
-        // 若未显式配置组件，则按注册信息自动实例化：默认单例；若声明了 instances 列表则逐个实例化
+        // 统一入口：必须显式装配组件。若未配置，立即报错，避免出现多种装配体验。
         if self.cfg.components.is_empty() {
-            for reg in crate::registry::all() {
-                let kind = (reg.kind)();
-                let instances = (reg.instances)();
-                if instances.is_empty() {
-                    // default instance id: use type name for readability
-                    self.cfg.components.push(crate::config::ComponentConfig {
-                        id: (reg.type_name)().to_string(),
-                        kind,
-                    });
-                } else {
-                    for &name in instances.iter() {
-                        self.cfg.components.push(crate::config::ComponentConfig {
-                            id: name.to_string(),
-                            kind,
-                        });
-                    }
-                }
-            }
+            return Err(anyhow::anyhow!(
+                "no components configured: call App::add_component::<T>(id) before start()"
+            ));
         }
         // 冻结配置存储
         let cfg_store = if let Some(f) = self.frozen_cfg.clone() {
@@ -95,15 +90,7 @@ impl App {
             self.frozen_cfg = Some(frozen.clone());
             frozen
         };
-        // 预构建工厂表：KindId -> factory
-        let mut factories: std::collections::HashMap<
-            crate::bus::KindId,
-            std::sync::Arc<dyn crate::component::ComponentFactory>,
-        > = std::collections::HashMap::new();
-        for reg in crate::registry::all() {
-            let f = (reg.new_factory)();
-            factories.entry(f.kind_id()).or_insert(f);
-        }
+    // 工厂表来自 add_component 阶段登记的 KindId -> Factory
 
         // 校验路由约束：凡 handler 声明 from=Kind 且未指明 instance，要求系统中该 kind 只有一个实例
         let mut instance_count: std::collections::HashMap<crate::bus::KindId, usize> =
@@ -123,9 +110,13 @@ impl App {
         let handle = self.bus.handle();
         for cc in self.cfg.components.iter() {
             // 查表匹配配置的 kind（KindId）
-            let factory = match factories.get(&cc.kind) {
+            let factory = match self.factories.get(&cc.kind) {
                 Some(f) => f.clone(),
-                None => return Err(anyhow::anyhow!("unknown component kind")),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "unknown component kind: ensure component type with #[component] is linked and added"
+                    ));
+                }
             };
             let id = cc.id.clone();
             let bus_handle = handle.clone();

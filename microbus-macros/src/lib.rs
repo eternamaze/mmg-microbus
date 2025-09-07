@@ -1,34 +1,15 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::parse::Parser;
 use syn::parse::{Parse, ParseStream};
-use syn::punctuated::Punctuated;
 use syn::Ident;
 use syn::{
-    parse_macro_input, Attribute, Expr, Item, ItemImpl, ItemStruct, LitStr, MetaNameValue, Token,
+    parse_macro_input, Attribute, Item, ItemImpl, ItemStruct, LitStr, Token,
     Type,
 };
 
 // 仅保留强类型“方法即订阅”路径。
 
-#[proc_macro_attribute]
-pub fn component_factory(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let item = parse_macro_input!(input as ItemImpl);
-    let self_ty = &item.self_ty;
-    let expanded = quote! {
-        #item
-        #[doc(hidden)]
-    mmg_microbus::inventory::submit! {
-            mmg_microbus::registry::Registration {
-                kind: || mmg_microbus::bus::KindId::of::<#self_ty>(),
-                type_name: || std::any::type_name::<#self_ty>(),
-                instances: || &[],
-                new_factory: || { std::sync::Arc::new(<#self_ty as Default>::default()) },
-            }
-    }
-    };
-    expanded.into()
-}
+// removed: component_factory; single path is #[component] on struct + impl
 
 #[proc_macro_attribute]
 pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -43,7 +24,7 @@ pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
-fn component_for_struct(item: ItemStruct, args: proc_macro2::TokenStream) -> TokenStream {
+fn component_for_struct(item: ItemStruct, _args: proc_macro2::TokenStream) -> TokenStream {
     let struct_ident = &item.ident;
     // Check fields; require `id` field; optionally `cfg`
     let mut has_id = false;
@@ -70,67 +51,12 @@ fn component_for_struct(item: ItemStruct, args: proc_macro2::TokenStream) -> Tok
         .to_compile_error()
         .into();
     }
-    // parse args: #[component] or #[component(instances=["a","b"])]; default implicit singleton
-    let mut instances: Vec<String> = Vec::new();
-    if !args.is_empty() {
-        // Accept comma separated name-value pairs
-        let punct: Punctuated<MetaNameValue, Token![,]> =
-            match Punctuated::<MetaNameValue, Token![,]>::parse_terminated.parse2(args.clone()) {
-                Ok(p) => p,
-                Err(e) => return e.to_compile_error().into(),
-            };
-        for nv in punct.iter() {
-            if nv.path.is_ident("instances") {
-                match &nv.value {
-                    Expr::Array(arr) => {
-                        for el in arr.elems.iter() {
-                            if let Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(ls),
-                                ..
-                            }) = el
-                            {
-                                instances.push(ls.value());
-                            } else {
-                                return syn::Error::new_spanned(
-                                    el,
-                                    "instances must be array of string literals",
-                                )
-                                .to_compile_error()
-                                .into();
-                            }
-                        }
-                    }
-                    other => {
-                        return syn::Error::new_spanned(
-                            other,
-                            "instances must be an array literal",
-                        )
-                        .to_compile_error()
-                        .into();
-                    }
-                }
-            } else {
-                return syn::Error::new_spanned(&nv.path, "unknown key in #[component(...)]")
-                    .to_compile_error()
-                    .into();
-            }
-        }
-    }
-
     let factory_ident = format_ident!("__{}Factory", struct_ident);
     let build_body = if has_cfg {
         quote! { Ok(Box::new(#struct_ident { id, cfg: Default::default() })) }
     } else {
         quote! { Ok(Box::new(#struct_ident { id })) }
     };
-    // gen instances slice literal
-    let inst_lits: Vec<proc_macro2::TokenStream> = instances
-        .iter()
-        .map(|s| {
-            let ls = syn::LitStr::new(s, proc_macro2::Span::call_site());
-            quote! { #ls }
-        })
-        .collect();
     let expanded = quote! {
         #item
         #[doc(hidden)]
@@ -142,14 +68,11 @@ fn component_for_struct(item: ItemStruct, args: proc_macro2::TokenStream) -> Tok
             fn type_name(&self) -> &'static str { std::any::type_name::<#struct_ident>() }
             async fn build(&self, id: mmg_microbus::bus::ComponentId, _bus: mmg_microbus::bus::BusHandle) -> anyhow::Result<Box<dyn mmg_microbus::component::Component>> { #build_body }
         }
-    mmg_microbus::inventory::submit! {
-            mmg_microbus::registry::Registration {
-                kind: || mmg_microbus::bus::KindId::of::<#struct_ident>(),
-                type_name: || std::any::type_name::<#struct_ident>(),
-                instances: || &[ #( #inst_lits ),* ],
-                new_factory: || { std::sync::Arc::new(#factory_ident::default()) },
-            }
-    }
+        impl mmg_microbus::component::RegisteredComponent for #struct_ident {
+            fn kind_id() -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#struct_ident>() }
+            fn type_name() -> &'static str { std::any::type_name::<#struct_ident>() }
+            fn factory() -> mmg_microbus::component::DynFactory { std::sync::Arc::new(#factory_ident::default()) }
+        }
     };
     expanded.into()
 }
