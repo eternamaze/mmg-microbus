@@ -10,7 +10,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::Arc,
 };
-use tokio::sync::{mpsc, RwLock, watch};
+use tokio::sync::{mpsc, watch, RwLock};
 //
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -120,10 +120,7 @@ impl<T> Subscription<T> {
         self.rx.recv().await
     }
     /// Receive next message or end on shutdown. When the shutdown receiver signals, returns None.
-    pub async fn recv_or_shutdown(
-        &mut self,
-        shutdown: &watch::Receiver<bool>,
-    ) -> Option<Arc<T>> {
+    pub async fn recv_or_shutdown(&mut self, shutdown: &watch::Receiver<bool>) -> Option<Arc<T>> {
         let mut sd = shutdown.clone();
         tokio::select! {
             _ = sd.changed() => {
@@ -297,7 +294,7 @@ impl BusHandle {
         if total == 0 {
             return;
         }
-    // 单一路径：阻塞发送（不丢包）。保持最小必要队列，抵抗短暂抖动。
+        // 单一路径：阻塞发送（不丢包）。保持最小必要队列，抵抗短暂抖动。
         // total==1 快路径：不分配 recipients 容器
         if total == 1 {
             if let Some(s) = &senders_exact {
@@ -391,7 +388,6 @@ impl BusHandle {
                     *list = new_list;
                 }
             }
-
         }
     }
     pub async fn publish<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
@@ -439,7 +435,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn wildcard_and_pattern_work() {
-    let bus = Bus::new(8);
+        let bus = Bus::new(8);
         let h = bus.handle();
         struct S;
         struct A;

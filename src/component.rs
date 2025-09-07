@@ -1,6 +1,11 @@
 use crate::bus::{Address, BusHandle, ComponentId, KindId, ServiceAddr};
 use async_trait::async_trait;
-use std::{any::{Any, TypeId}, fmt, sync::Arc, collections::HashMap};
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+};
 use tokio::sync::watch;
 
 // 已由 bus.rs 定义强类型 ComponentId
@@ -43,25 +48,45 @@ pub struct ConfigStore {
     inner: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 impl ConfigStore {
-    pub fn empty() -> Self { Self { inner: Arc::new(HashMap::new()) } }
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(HashMap::new()),
+        }
+    }
     pub fn from_frozen_map(map: HashMap<TypeId, Arc<dyn Any + Send + Sync>>) -> Self {
-        Self { inner: Arc::new(map) }
+        Self {
+            inner: Arc::new(map),
+        }
     }
     pub fn get<T: 'static + Send + Sync>(&self) -> Option<Arc<T>> {
         let tid = TypeId::of::<T>();
-        self.inner.get(&tid).and_then(|v| v.clone().downcast::<T>().ok())
+        self.inner
+            .get(&tid)
+            .and_then(|v| v.clone().downcast::<T>().ok())
     }
 }
 
 pub struct ComponentContext {
-    pub id: crate::bus::ComponentId,
-    pub self_addr: ServiceAddr,
-    pub bus: BusHandle,
-    pub shutdown: watch::Receiver<bool>,
-    pub cfg: ConfigStore,
+    id: crate::bus::ComponentId,
+    self_addr: ServiceAddr,
+    bus: BusHandle,
+    shutdown: watch::Receiver<bool>,
+    cfg: ConfigStore,
 }
 
 impl ComponentContext {
+    /// Component unique id
+    pub fn id(&self) -> &crate::bus::ComponentId {
+        &self.id
+    }
+    /// Component strong-typed service address
+    pub fn service_addr(&self) -> &ServiceAddr {
+        &self.self_addr
+    }
+    /// Access a frozen config object by type
+    pub fn config<T: 'static + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.cfg.get::<T>()
+    }
     pub fn new_with_service(
         id: ComponentId,
         service: KindId,
@@ -84,34 +109,7 @@ impl ComponentContext {
 
     // Keep a single constructor to avoid confusion; components are always typed by kind.
 
-    pub async fn subscribe_from<T: Send + Sync + 'static>(
-        &self,
-        from: &Address,
-    ) -> crate::bus::Subscription<T> {
-        self.bus.subscribe::<T>(from).await
-    }
-    pub async fn subscribe_pattern<T: Send + Sync + 'static>(
-        &self,
-        pattern: Address,
-    ) -> crate::bus::Subscription<T> {
-        self.bus.subscribe_pattern::<T>(pattern).await
-    }
-    /// Subscribe and get an auto-shutdown subscription: recv will end when App stops.
-    pub async fn subscribe_from_auto<T: Send + Sync + 'static>(
-        &self,
-        from: &Address,
-    ) -> AutoSubscription<T> {
-        let sub = self.bus.subscribe::<T>(from).await;
-        AutoSubscription { inner: sub, shutdown: self.shutdown.clone() }
-    }
-    /// Pattern subscribe with auto-shutdown behavior.
-    pub async fn subscribe_pattern_auto<T: Send + Sync + 'static>(
-        &self,
-        pattern: Address,
-    ) -> AutoSubscription<T> {
-        let sub = self.bus.subscribe_pattern::<T>(pattern).await;
-        AutoSubscription { inner: sub, shutdown: self.shutdown.clone() }
-    }
+    // 删除对外订阅 API：业务方不应直接访问框架订阅。宏使用下面的 crate 可见函数。
     pub async fn publish<T: Send + Sync + 'static>(&self, msg: T) {
         let me = Address {
             service: Some(self.self_addr.service),
@@ -125,6 +123,17 @@ impl ComponentContext {
     // 仅提供强类型通道（&T），不提供 Any 自动装配通道。
 
     // 不再提供配置热更新：配置仅在启动时一次性注入
+
+    #[doc(hidden)]
+    pub(crate) fn __fork(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            self_addr: self.self_addr.clone(),
+            bus: self.bus.clone(),
+            shutdown: self.shutdown.clone(),
+            cfg: self.cfg.clone(),
+        }
+    }
 }
 
 // ---- 配置注入上下文与契约 ----
@@ -149,5 +158,66 @@ impl ComponentContext {
             _ = sd.changed() => {}
             _ = tokio::time::sleep(dur) => {}
         }
+    }
+
+    /// Create an auto-shutdown ticker. `tick().await` returns None when the App stops.
+    pub fn ticker(&self, dur: std::time::Duration) -> AutoTicker {
+        AutoTicker {
+            intv: tokio::time::interval(dur),
+            shutdown: self.shutdown.clone(),
+        }
+    }
+
+    /// Spawn a task that will be aborted automatically when App stops.
+    /// This avoids wiring shutdown checks inside business logic.
+    pub fn spawn_until_shutdown<F>(&self, fut: F) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut sd = self.shutdown.clone();
+        tokio::spawn(async move {
+            // Run future in its own task so we can abort it on shutdown
+            let mut handle = tokio::spawn(fut);
+            tokio::select! {
+                _ = sd.changed() => {
+                    handle.abort();
+                    let _ = handle.await; // ignore error on abort
+                }
+                _ = &mut handle => {
+                    // inner completed; nothing else to do
+                }
+            }
+        })
+    }
+}
+
+/// A ticker that stops automatically when App shutdown is signaled.
+pub struct AutoTicker {
+    intv: tokio::time::Interval,
+    shutdown: watch::Receiver<bool>,
+}
+impl AutoTicker {
+    /// Wait for next tick; returns None when App is stopping.
+    pub async fn tick(&mut self) -> Option<()> {
+        let mut sd = self.shutdown.clone();
+        tokio::select! {
+            _ = sd.changed() => None,
+            _ = self.intv.tick() => Some(()),
+        }
+    }
+}
+
+// (no extra runtime glue needed: macro根据返回类型生成自动发布代码)
+
+// ---- crate 内部宏辅助 API（不暴露给业务）----
+#[doc(hidden)]
+pub async fn __subscribe_pattern_auto<T: Send + Sync + 'static>(
+    ctx: &ComponentContext,
+    pattern: Address,
+) -> AutoSubscription<T> {
+    let sub = ctx.bus.subscribe_pattern::<T>(pattern).await;
+    AutoSubscription {
+        inner: sub,
+        shutdown: ctx.shutdown.clone(),
     }
 }

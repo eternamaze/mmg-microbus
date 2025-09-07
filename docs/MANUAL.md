@@ -16,7 +16,7 @@ use mmg_microbus::prelude::*;
 #[mmg_microbus::component]
 struct App { id: mmg_microbus::bus::ComponentId }
 
-#[mmg_microbus::handles]
+#[mmg_microbus::component]
 impl App {
   #[mmg_microbus::handle(Tick)]
   async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## 方法即订阅（唯一路径）
 1) 标注组件：`#[component] struct S { id: ComponentId }`
-2) 写处理函数：`#[handles] impl S { async fn on_xxx(&mut self, ...T...) -> Result<()> }`
+2) 写处理函数：`#[component] impl S { #[handle(T)] async fn on_xxx(&mut self, &T, ...cfg...) -> Result<()> }`
 3) 可选过滤：`#[handle(T, from=Kind, instance=MarkerType)]`（`MarkerType` 需实现 `InstanceMarker`）
 4) 启动：自行提供 Tokio 入口，使用 `App::new + add_component::<T>(id) + start()/stop()` 进行生命周期控制。
 
@@ -47,9 +47,9 @@ async fn main() -> anyhow::Result<()> {
 - 当签名无法推断时显式写 `#[handle(T)]`
 
 ## 组件是一等公民：主动消息源
-`#[handles]` 是语法糖，会为你的结构体自动生成 `Component::run` 并把消息分发到标注的方法，适合“被动响应”型组件。要实现“主动推送”的消息源（例如定时采集/轮询外部系统），请直接实现组件的 `run()`，在其中使用 `ctx.publish(...)` 主动向总线发消息；生命周期方面可使用“自动随停订阅/优雅睡眠”避免显式处理关停逻辑。
+`#[component]` 标注在 impl 上会为你的结构体自动生成 `Component::run` 并把消息分发到方法，适合“被动响应”型组件；同一组件内也可写主动函数 `#[active(..)]`，由框架按参数调度循环，主动/被动统一为“组件是一等公民”。
 
-最小示例：
+主动与被动混合示例：
 ```rust
 #[derive(Clone, Debug)]
 struct Tick(pub u64);
@@ -57,18 +57,13 @@ struct Tick(pub u64);
 #[mmg_microbus::component]
 struct Feeder { id: mmg_microbus::bus::ComponentId }
 
-#[async_trait::async_trait]
-impl mmg_microbus::component::Component for Feeder {
-  fn id(&self) -> &mmg_microbus::bus::ComponentId { &self.id }
-  async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> anyhow::Result<()> {
-    let mut n = 0u64;
-    let mut intv = tokio::time::interval(std::time::Duration::from_millis(200));
-    loop {
-      tokio::select! {
-  _ = intv.tick() => { n += 1; ctx.publish(Tick(n)).await; }
-  // 可选：若有等待场景，优先使用 ctx.graceful_sleep(..) 或 auto 订阅的 recv()
-      }
-    }
+#[mmg_microbus::component]
+impl Feeder {
+  #[mmg_microbus::active(interval_ms=200, immediate=true)]
+  async fn pump(&self, ctx: &mmg_microbus::component::ComponentContext) -> anyhow::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    ctx.publish(Tick(n)).await;
     Ok(())
   }
 }
@@ -76,7 +71,7 @@ impl mmg_microbus::component::Component for Feeder {
 #[mmg_microbus::component]
 struct Trader { id: mmg_microbus::bus::ComponentId }
 
-#[mmg_microbus::handles]
+#[mmg_microbus::component]
 impl Trader {
   #[mmg_microbus::handle(Tick, from=Feeder)]
   async fn on_tick(&mut self, _tick: &Tick) -> anyhow::Result<()> {
@@ -85,8 +80,8 @@ impl Trader {
 }
 ```
 要点：
-- 主动源写自定义 `run`，消费方仍可用 `#[handles]` 订阅；这体现了“组件是一等公民，handlers 只是语法糖”的设计。
-- IoC 友好停机：若使用手写 `run`，可通过 `ctx.subscribe_*_auto()` 获取“自动随停订阅”，或用 `sub.recv_or_shutdown(&ctx.shutdown)`；也可用 `ctx.graceful_sleep(dur)` 在停机时提前返回，避免显式处理 `shutdown` 分支。
+- 主动函数无需手写 `run`，由 #[active] 调度；消费方用 #[handle] 即可处理。
+- IoC 友好停机：主动与被动均会在 App 停止时自动退出；无需在业务侧书写显式 shutdown 分支。
 
 ## 配置即对象（启动前一次性注入）
 - 在 handler 形参中直接声明 `&MyCfg` 即可自动注入配置对象。
@@ -97,7 +92,7 @@ impl Trader {
 #[derive(Clone)]
 struct MyCfg { queue_capacity: usize }
 
-#[mmg_microbus::handles]
+#[mmg_microbus::component]
 impl Worker {
   async fn on_tick(&mut self, _t: &Tick, cfg: &MyCfg) -> anyhow::Result<()> {
     // 使用 cfg
@@ -119,26 +114,24 @@ app.provide_config(MyCfg { queue_capacity: 256 }).await?;
 - 唯一地址模型：`Address { service: Option<KindId>, instance: Option<ComponentId> }`
 - 精确地址：`Address::of_instance::<S, I>()`；模式：`Address::for_kind::<S>()` / `Address::any()`。
 
-示例：
-```rust
-use mmg_microbus::bus::Address;
-let mut sub = ctx.subscribe_pattern::<Tick>(Address::for_kind::<Feeder>()).await;
-let mut sub = ctx.subscribe_pattern_auto::<Tick>(Address::for_kind::<Feeder>()).await;
-while let Some(tick) = sub.recv().await { /* use tick; 自动随停 */ }
-```
+（内部机制）框架使用模式订阅与强类型路由，但业务代码无需直接调用订阅 API。
 
 ## 宏快速参考（用户可用）
 - #[component]
   - 目标：注册一个组件工厂，使框架能发现并实例化组件。
   - 要求：结构体需含字段 `id: ComponentId`；可选 `cfg` 字段（用于保存外部配置）。
-- #[handles]
-  - 目标：为一个 `impl` 块内的处理方法生成 `Component::run` 与订阅/分发逻辑。
-  - 形参注入：可接受 `&ComponentContext`，以及消息参数 `&T`。
-  - 与 #[handle] 联合使用（见下）。
+- #[active(interval_ms=.., times=.., immediate=..)]
+  - 目标：声明主动函数的调度策略；由框架生成 ticker 驱动的循环。
+  - 形参注入：可接受 `&ComponentContext` 与 `&CfgType`。
 - #[handle(T, from=Kind, instance=Marker)]
   - 目标：为方法声明处理的消息类型与（可选）来源过滤；`Marker` 为实现了 `InstanceMarker` 的零尺寸类型。
   - 备注：当方法签名无法推断 T 时必须显式写 `T`。
 // 配置注入无需宏；直接在方法签名以 `&CfgType` 声明即可。
+
+## 启停收敛（面向业务的低侵入）
+- 启动/停止：仅使用 `App::start().await?` 与 `app.stop().await`。
+- 被动组件：写 `#[handle]` 方法体；生命周期与订阅由框架自动生成的 `run` 托管。
+- 主动组件：写 `#[active(..)]` 方法；无需手写循环与关停分支。
 
 ## 故障排查
 - 没收到消息：
@@ -153,8 +146,10 @@ while let Some(tick) = sub.recv().await { /* use tick; 自动随停 */ }
 
 ## 示例
 - 示例：
-  - `examples/final_showcase.rs`（来源过滤、实例约束、上下文注入、配置与外部发布）。
-  - `examples/active_source.rs`（组件是一等公民；自定义 run 主动推送消息，其他组件用 #[handles] 订阅处理）。
+  - `examples/all_in_one.rs`（来源过滤、实例约束、上下文注入、配置与外部发布，以及 #[active] 主动循环示例）。
+
+## 进一步阅读
+- 设计期望与使用规范：见 `docs/EXPECTATIONS.md`（注解放置规则、类型化注入、多实例语义、生命周期等）。
 
 ---
 

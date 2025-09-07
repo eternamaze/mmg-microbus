@@ -12,7 +12,7 @@ struct Trader {
     id: mmg_microbus::bus::ComponentId,
 }
 
-#[mmg_microbus::handles]
+#[mmg_microbus::component]
 impl Trader {
     // 只读 &T 形态
     #[mmg_microbus::handle(Tick)]

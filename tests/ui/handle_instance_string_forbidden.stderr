@@ -1,5 +1,7 @@
 error: #[handle]: `instance` expects a marker type (impl InstanceMarker)
- --> tests/ui/handle_instance_string_forbidden.rs:8:53
+ --> tests/ui/handle_instance_string_forbidden.rs:6:1
   |
-8 |     #[mmg_microbus::handle(Tick, from=Src, instance="x")] // ERROR: string instance forbidden
-  |                                                     ^^^
+6 | #[mmg_microbus::component]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `mmg_microbus::component` (in Nightly builds, run with -Z macro-backtrace for more info)

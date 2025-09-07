@@ -12,7 +12,7 @@ use mmg_microbus::prelude::*;
 #[mmg_microbus::component]
 struct App { id: mmg_microbus::bus::ComponentId }
 
-#[mmg_microbus::handles]
+#[mmg_microbus::component]
 impl App {
   async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
   println!("tick {}", tick.0); Ok(())
@@ -29,23 +29,26 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-完整示例：见 `examples/final_showcase.rs`（来源过滤、实例约束、上下文注入与自发布）。
+完整示例：见 `examples/all_in_one.rs`（来源过滤、实例约束、主动/被动函数、配置注入与自发布）。
 
 使用要点
 - 默认参数形态：`&T`；可按需注入 `&ComponentContext`。
 - 过滤注解：使用类型标记 `#[handle(T, from=ServiceType, instance=MarkerType)]`（`MarkerType` 必须实现 `InstanceMarker`）。
 - 配置注入：在 handler 形参中直接声明 `&MyCfg`；启动前通过 `app.provide_config(MyCfg { .. }).await?` 一次性注入（运行期不支持热更新，无需序列化/反序列化）。
 - 运行语义：阻塞直送不丢包；按需清理，无周期扫描；单订阅快路径与小向量优化。
- - 生命周期：由 `App` 统一启停；手写 `run` 可用 `ctx.subscribe_*_auto()` 获取“自动随停订阅”，或 `sub.recv_or_shutdown(&ctx.shutdown)`；也可用 `ctx.graceful_sleep(dur)` 简化退出处理。
+- 生命周期：由 `App` 统一启停；通常无需手写 `run`。主动函数使用 `#[active(..)]`，被动函数使用 `#[handle(..)]`，返回值自动发布。
+
+更多规范
+- 期望与约束见 `docs/EXPECTATIONS.md`（注解放置规则、类型化注入、多实例语义、生命周期等）。
 
 推荐默认路径（面向使用者的一致心智）
 - 发布：在 handler 中通过 `ComponentContext::publish(msg)`；外部通过 `App::bus_handle().publish(Address::of_instance::<S, I>(), msg)`。
 - 订阅（被动 handler）：参数统一为 `&T`，按需使用 `#[handle(T, ...)]` 做来源过滤。
-- 订阅（主动源/循环）：可用 `ComponentContext::subscribe_pattern::<T>(...)`。
+- 主动函数：使用 `#[active(interval_ms=.., times=.., immediate=..)]` 定义循环行为。
 
 API 要点（单一路径）
 - 仅 `&T` 形参；不支持 Envelope/ScopedBus。
-- 统一地址模型 `Address`；订阅推荐使用 `subscribe_pattern(Address)`。
+- 统一地址模型 `Address`（对使用者默认按类型路由）；无需直接调用订阅 API。
 
 边界
 - 同进程强类型总线；不含网络/跨进程。

@@ -3,7 +3,7 @@ use mmg_microbus::prelude::*;
 #[mmg_microbus::component]
 struct C { id: mmg_microbus::bus::ComponentId }
 
-#[mmg_microbus::handles]
+#[mmg_microbus::component]
 impl C {
     #[mmg_microbus::handle(Tick, from=Src, instance="x")] // ERROR: string instance forbidden
     async fn on_tick(&mut self, _tick: &Tick) -> Result<()> { Ok(()) }
