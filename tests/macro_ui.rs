@@ -1,16 +1,6 @@
-//! Compile-fail UI tests for #[handles]/#[handle]
+//! Compile-fail UI tests for #[handle]
 
-#[test]
-fn ui_handle_instance_without_from_fails() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/handle_instance_without_from.rs");
-}
-
-#[test]
-fn ui_handle_instance_string_forbidden_fails() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/handle_instance_string_forbidden.rs");
-}
+// removed: previous compile-fail cases for instance filtering are obsolete after syntax change
 
 #[test]
 fn ui_handle_happy_min_ok() {

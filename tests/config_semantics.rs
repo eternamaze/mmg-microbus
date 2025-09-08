@@ -33,7 +33,7 @@ async fn config_last_write_wins_with_warning() {
     // 订阅 Echoer 在 #[init] 阶段发布的 CfgEcho
     let h = app.bus_handle();
     let mut sub = h
-        .subscribe_pattern::<CfgEcho>(mmg_microbus::bus::Address::for_kind::<Echoer>())
+        .subscribe::<CfgEcho>(&mmg_microbus::bus::Address { service: None, instance: Some(mmg_microbus::bus::ComponentId("e1".to_string())) })
         .await;
 
     app.start().await.unwrap();
@@ -67,7 +67,7 @@ async fn config_many_is_thin_wrapper_over_config() {
 
     let h = app.bus_handle();
     let mut sub = h
-        .subscribe_pattern::<CfgEcho>(mmg_microbus::bus::Address::for_kind::<Echoer>())
+        .subscribe::<CfgEcho>(&mmg_microbus::bus::Address { service: None, instance: Some(mmg_microbus::bus::ComponentId("e1".to_string())) })
         .await;
 
     app.start().await.unwrap();

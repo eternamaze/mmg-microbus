@@ -14,7 +14,6 @@ pub struct App {
     tasks: Vec<JoinHandle<()>>,
     started: bool,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    shutdown_linger: std::time::Duration,
     factories: std::collections::HashMap<
         crate::bus::KindId,
         std::sync::Arc<dyn crate::component::ComponentFactory>,
@@ -33,14 +32,12 @@ impl App {
     pub fn new(cfg: AppConfig) -> Self {
         let bus = Bus::new(cfg.queue_capacity);
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        let linger = std::time::Duration::from_millis(cfg.shutdown_linger_ms);
         Self {
             cfg,
             bus,
             tasks: Vec::new(),
             started: false,
             shutdown_tx: tx,
-            shutdown_linger: linger,
             factories: std::collections::HashMap::new(),
             cfg_map: std::collections::HashMap::new(),
             frozen_cfg: None,
@@ -80,11 +77,7 @@ impl App {
             let any_box: Box<dyn Any + Send + Sync> = Box::new(cfg);
             match any_box.downcast::<AppConfig>() {
                 Ok(b) => {
-                    if self.app_cfg_set {
-                        tracing::warn!("AppConfig provided multiple times before start; overriding previous values");
-                    }
-                    self.app_cfg_set = true;
-                    self.apply_app_config(*b);
+                    self.set_app_config(*b);
                 }
                 Err(_) => {
                     debug_assert!(false, "TypeId matched AppConfig but downcast failed");
@@ -128,7 +121,18 @@ impl App {
         // 组件列表通常通过 add_component 维护；如通过 AppConfig 提供，也予以接纳。
         self.cfg = cfg.clone();
         self.bus = Bus::new(self.cfg.queue_capacity);
-        self.shutdown_linger = std::time::Duration::from_millis(self.cfg.shutdown_linger_ms);
+    }
+    /// 设置框架配置的专用通道，避免和业务配置混用。
+    pub fn set_app_config(&mut self, cfg: AppConfig) {
+        if self.started {
+            tracing::warn!("set_app_config called after start(); ignoring");
+            return;
+        }
+        if self.app_cfg_set {
+            tracing::warn!("AppConfig provided multiple times before start; overriding previous values");
+        }
+        self.app_cfg_set = true;
+        self.apply_app_config(cfg);
     }
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
@@ -150,22 +154,7 @@ impl App {
         };
         // 工厂表来自 add_component 阶段登记的 KindId -> Factory
 
-        // 校验路由约束：凡 handler 声明 from=Kind 且未指明 instance，要求系统中该 kind 只有一个实例
-        let mut instance_count: std::collections::HashMap<crate::bus::KindId, usize> =
-            std::collections::HashMap::new();
-        for c in self.cfg.components.iter() {
-            *instance_count.entry(c.kind).or_insert(0) += 1;
-        }
-        for rc in crate::registry::route_constraints() {
-            let n = instance_count.get(&(rc.from_kind)()).cloned().unwrap_or(0);
-            if n == 0 {
-                return Err(anyhow::anyhow!("route constraint failed: {} expects singleton of kind {:?}, but none configured", (rc.consumer_ty)(), (rc.from_kind)()));
-            }
-            if n > 1 {
-                return Err(anyhow::anyhow!("route constraint failed: {} expects singleton of kind {:?}, but {} instances configured; specify instance in #[handle(.., instance=..)]", (rc.consumer_ty)(), (rc.from_kind)(), n));
-            }
-        }
-        // 放宽静态检查：不再强制“所有订阅类型必须存在发布者”。
+    // 不再进行路由约束检查：handle 仅按消息类型与可选实例字符串过滤，无需检验组件种类单例性。
 
         let handle = self.bus.handle();
         for cc in self.cfg.components.iter() {
@@ -227,10 +216,6 @@ impl App {
     }
     pub fn is_started(&self) -> bool {
         self.started
-    }
-    pub fn set_shutdown_linger(&mut self, dur: std::time::Duration) -> &mut Self {
-        self.shutdown_linger = dur;
-        self
     }
 }
 

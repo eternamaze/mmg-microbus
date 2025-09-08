@@ -15,7 +15,7 @@ struct Trader {
 #[mmg_microbus::component]
 impl Trader {
     // &T 形态，注入上下文
-    #[mmg_microbus::handle(Tick)]
+    #[mmg_microbus::handle(instance="ext-1")]
     async fn on_tick(
         &mut self,
         _ctx: &mmg_microbus::component::ComponentContext,
@@ -26,7 +26,7 @@ impl Trader {
     }
 
     // 负载形态，通过上下文发布 Ack
-    #[mmg_microbus::handle(Price)]
+    #[mmg_microbus::handle(instance="ext-1")]
     async fn on_price(
         &mut self,
         ctx: &mmg_microbus::component::ComponentContext,
@@ -48,8 +48,9 @@ async fn method_based_subscription_works() {
 
     // 订阅 Trader 发出的 Ack
     let h = app.bus_handle();
+    // 现行语义：订阅需指明实例；这里订阅 trader-1 实例发出的 Ack
     let mut sub = h
-        .subscribe_pattern::<Ack>(mmg_microbus::bus::Address::for_kind::<Trader>())
+        .subscribe::<Ack>(&mmg_microbus::bus::Address { service: None, instance: Some(mmg_microbus::bus::ComponentId("trader-1".to_string())) })
         .await;
 
     // 从外部来源发布消息
@@ -99,7 +100,7 @@ async fn stop_hook_is_invoked_and_can_publish() {
     // 订阅 stop 消息
     let h = app.bus_handle();
     let mut sub = h
-        .subscribe_pattern::<Stopped>(mmg_microbus::bus::Address::for_kind::<Stoppable>())
+        .subscribe::<Stopped>(&mmg_microbus::bus::Address { service: None, instance: Some(mmg_microbus::bus::ComponentId("s1".to_string())) })
         .await;
 
     app.start().await.unwrap();

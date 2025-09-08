@@ -18,8 +18,12 @@ struct App { id: mmg_microbus::bus::ComponentId }
 
 #[mmg_microbus::component]
 impl App {
-  #[mmg_microbus::handle(Tick)]
-  async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> {
+  #[mmg_microbus::handle]
+  async fn on_tick(
+    &mut self,
+    ctx: &mmg_microbus::component::ComponentContext,
+    tick: &Tick,
+  ) -> anyhow::Result<()> {
     println!("tick {}", tick.0);
     Ok(())
   }
@@ -37,14 +41,13 @@ async fn main() -> anyhow::Result<()> {
 
 ## 方法即订阅（唯一路径）
 1) 标注组件：`#[component] struct S { id: ComponentId }`
-2) 写处理函数：`#[component] impl S { #[handle(T)] async fn on_xxx(&mut self, &T) -> Result<()> }`
-3) 可选过滤：`#[handle(T, from=Kind, instance=MarkerType)]`（`MarkerType` 需实现 `InstanceMarker`）
+2) 写处理函数：`#[component] impl S { #[handle] async fn on_xxx(&mut self, &ComponentContext, &T) -> Result<()> }`
+3) 可选过滤：`#[handle(instance="id")]` 或 `#[handle(instances=["a","b"]))`
 4) 启动：自行提供 Tokio 入口，使用 `App::new + add_component::<T>(id) + start()/stop()` 进行生命周期控制。
 
 签名即语义：
-- 参数形态：`&T`
-- 可注入：`&ComponentContext`
-- 当签名无法推断时显式写 `#[handle(T)]`
+- 参数形态：固定为 `(&ComponentContext, &T)`
+- 注解仅用于实例过滤；不在注解中书写类型。
 
 ## 组件是一等公民：主动消息源
 `#[component]` 标注在 impl 上会为你的结构体自动生成 `Component::run` 并把消息分发到方法，适合“被动响应”型组件；同一组件内也可写主动函数 `#[active(..)]`，由框架调度循环，主动/被动统一为“组件是一等公民”。
@@ -73,8 +76,12 @@ struct Trader { id: mmg_microbus::bus::ComponentId }
 
 #[mmg_microbus::component]
 impl Trader {
-  #[mmg_microbus::handle(Tick, from=Feeder)]
-  async fn on_tick(&mut self, _tick: &Tick) -> anyhow::Result<()> {
+  #[mmg_microbus::handle]
+  async fn on_tick(
+      &mut self,
+      _ctx: &mmg_microbus::component::ComponentContext,
+      _tick: &Tick,
+  ) -> anyhow::Result<()> {
     Ok(())
   }
 }
@@ -126,13 +133,14 @@ app.config_many(|a| Box::pin(async move {
 - 发送：阻塞直送（不丢包）；小型有界队列仅吸收调度抖动。
 - 清理：按需清理；检测到 `sender` 关闭即修剪。
 - 性能：单订阅快路径；`SmallVec` 降低 fanout 分配；最后一次 `move` 避免多余 `Arc` 克隆。
+ - 运行期开关：不支持任何运行期开关（pause/resume 已移除）。
  
 
-## 强类型路由与模式订阅
+## 强类型路由与订阅
 - 唯一地址模型：`Address { service: Option<KindId>, instance: Option<ComponentId> }`
-- 精确地址：`Address::of_instance::<S, I>()`；模式：`Address::for_kind::<S>()` / `Address::any()`。
+- 精确地址：`Address::of_instance::<S, I>()`；类型级（任意来源）：省略实例过滤即可。
 
-（内部机制）框架使用模式订阅与强类型路由，但业务代码无需直接调用订阅 API。
+（内部机制）框架使用“类型级 + 精确实例”两级索引；业务代码无需直接调用订阅 API。
 
 ## 宏快速参考（用户可用）
 - #[component]
@@ -141,14 +149,14 @@ app.config_many(|a| Box::pin(async move {
 - #[active(interval_ms=.., times=.., immediate=..)]
   - 目标：声明主动函数的调度策略；由框架生成 ticker 驱动的循环。
   - 形参注入：仅可接受 `&ComponentContext`。
-- #[handle(T, from=Kind, instance=Marker)]
+- #[handle(instance="id")] / #[handle(instances=["a","b"]) ]
   - 目标：为方法声明处理的消息类型与（可选）来源过滤；`Marker` 为实现了 `InstanceMarker` 的零尺寸类型。
   - 备注：当方法签名无法推断 T 时必须显式写 `T`。
 // 配置注入通过 #[init] 完成；#[handle]/#[active] 不支持 `&CfgType` 形参。
 
 ### 订阅规则与检查策略（重要）
-- 单函数单订阅：一个 `#[handle]` 方法只能订阅一个消息类型。方法签名中仅允许一个 `&T`（可选再加 `&ComponentContext`）。
-- 配线检查放宽：框架允许订阅的消息在运行时没有任何发布者，应用可正常启动；如需约束来源，请使用 `from=/instance=` 过滤。
+- 单函数单订阅：一个 `#[handle]` 方法只能订阅一个消息类型。方法签名必须为 `(&ComponentContext, &T)`（两参）。
+- 配线检查放宽：框架允许订阅的消息在运行时没有任何发布者，应用可正常启动；如需来源约束，请使用 `instance="id"` 或 `instances=["a","b"]` 过滤。
 
 ## 启停收敛（面向业务的低侵入）
 - 启动/停止：仅使用 `App::start().await?` 与 `app.stop().await`。
@@ -157,7 +165,7 @@ app.config_many(|a| Box::pin(async move {
 
 ## 故障排查
 - 没收到消息：
-  - 方法参数需为 `&T`；必要时显式写 `#[handle(T)]`。
+  - 方法参数需为 `(&ComponentContext, &T)`；注解无需写类型。
   - 检查过滤是否过严（from/instance）。
 - 配置未生效：确认组件实现了 `#[init]` 接收 `&CfgType` 并把配置保存到状态，且在启动前通过 `app.config(CfgType { .. })` 注入。
 
@@ -174,9 +182,6 @@ app.config_many(|a| Box::pin(async move {
 - 示例：
   - `examples/all_in_one.rs`（来源过滤、实例约束、上下文注入、通过 #[init] 注入配置与外部发布，以及 #[active] 主动循环示例）。
 
-## 进一步阅读
-- 设计期望与使用规范：见 `docs/EXPECTATIONS.md`（注解放置规则、类型化注入、多实例语义、生命周期等）。
-
 ---
 
-本手册即为本项目唯一权威说明书。
+本手册为项目的唯一权威说明书；开发与维护细节另见 `docs/DEVELOPMENT.md`。

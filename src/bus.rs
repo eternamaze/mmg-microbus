@@ -1,8 +1,7 @@
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ComponentId(pub String);
 use smallvec::SmallVec;
-use std::sync::atomic::Ordering;
-//
+
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -10,8 +9,9 @@ use std::{
     hash::{Hash, Hasher},
     sync::Arc,
 };
-use tokio::sync::{mpsc, watch, RwLock};
-//
+use tokio::sync::{mpsc, watch};
+use parking_lot::RwLock;
+
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct KindId(TypeId);
@@ -57,18 +57,6 @@ pub struct Address {
     pub instance: Option<ComponentId>,
 }
 impl Address {
-    pub fn any() -> Self {
-        Self {
-            service: None,
-            instance: None,
-        }
-    }
-    pub fn for_kind<T: 'static>() -> Self {
-        Self {
-            service: Some(KindId::of::<T>()),
-            instance: None,
-        }
-    }
     pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
         Self {
             service: Some(KindId::of::<C>()),
@@ -84,17 +72,8 @@ impl Address {
             _ => None,
         }
     }
-    fn matches(&self, addr: &ServiceAddr) -> bool {
-        (self
-            .service
-            .as_ref()
-            .map(|s| s == &addr.service)
-            .unwrap_or(true))
-            && (self
-                .instance
-                .as_ref()
-                .map(|i| i == &addr.instance)
-                .unwrap_or(true))
+    fn require_instance(&self) -> Option<ComponentId> {
+        self.instance.clone()
     }
 }
 
@@ -133,9 +112,16 @@ impl<T> Subscription<T> {
     }
 }
 
-type TopicMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
-type ServiceTopics = HashMap<ServiceAddr, TopicMap>;
-type PatternHandlers = Vec<Box<dyn Any + Send + Sync>>;
+// 订阅索引：支持类型级（any）与按实例聚合
+struct InstanceIndex<T: Send + Sync + 'static> {
+    any: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
+    by_instance: HashMap<ComponentId, SmallVec<[mpsc::Sender<Arc<T>>; 4]>>,
+}
+impl<T: Send + Sync + 'static> Default for InstanceIndex<T> {
+    fn default() -> Self {
+        Self { any: SmallVec::new(), by_instance: HashMap::new() }
+    }
+}
 
 #[derive(Clone)]
 pub struct BusHandle {
@@ -143,11 +129,8 @@ pub struct BusHandle {
 }
 
 struct BusInner {
-    topics: RwLock<ServiceTopics>,
-    patterns: RwLock<HashMap<TypeId, PatternHandlers>>,
+    subs: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     default_capacity: usize,
-    paused: std::sync::atomic::AtomicBool,
-    resume_notify: tokio::sync::Notify,
 }
 
 impl fmt::Debug for BusHandle {
@@ -155,23 +138,9 @@ impl fmt::Debug for BusHandle {
         f.debug_struct("BusHandle").finish()
     }
 }
-impl BusHandle {
-    pub fn pause(&self) {
-        self.inner.paused.store(true, Ordering::SeqCst);
-    }
-    pub fn resume(&self) {
-        self.inner.paused.store(false, Ordering::SeqCst);
-        self.inner.resume_notify.notify_waiters();
-    }
-}
+impl BusHandle {}
 
-struct Topic<T: Send + Sync + 'static> {
-    txs: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
-}
-struct PatternTopic<T: Send + Sync + 'static> {
-    pattern: Address,
-    txs: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
-}
+// 路由索引：类型级(any-of-type) 与 精确实例 两级
 
 pub struct Bus {
     handle: BusHandle,
@@ -179,11 +148,8 @@ pub struct Bus {
 impl Bus {
     pub fn new(default_capacity: usize) -> Self {
         let inner = BusInner {
-            topics: RwLock::new(HashMap::new()),
-            patterns: RwLock::new(HashMap::new()),
+            subs: RwLock::new(HashMap::new()),
             default_capacity,
-            paused: std::sync::atomic::AtomicBool::new(false),
-            resume_notify: tokio::sync::Notify::new(),
         };
         Self {
             handle: BusHandle {
@@ -198,200 +164,96 @@ impl Bus {
 
 impl BusHandle {
     pub async fn subscribe<T: Send + Sync + 'static>(&self, from: &Address) -> Subscription<T> {
-        let exact = match from.require_exact() {
-            Some(x) => x,
-            None => {
-                tracing::error!("subscribe<T> requires exact Address (service+instance)");
-                let (_tx, rx) = mpsc::channel::<Arc<T>>(self.inner.default_capacity);
-                return Subscription { rx };
-            }
-        };
-        let mut topics = self.inner.topics.write().await;
+        let mut subs = self.inner.subs.write();
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
-        let typed_map = topics.entry(exact.clone()).or_insert_with(HashMap::new);
-        let entry = typed_map.entry(type_id).or_insert_with(|| {
-            Box::new(Topic::<T> {
-                txs: SmallVec::new(),
-            }) as Box<dyn Any + Send + Sync>
-        });
-        let t = match entry.downcast_mut::<Topic<T>>() {
-            Some(t) => t,
-            None => {
-                tracing::error!(
-                    "type mismatch in subscribe<T>: service/instance has a different message type"
-                );
-                // 返回一个空订阅，避免运行期 panic；调用方将 recv() 到 None
-                let (_tx, rx) = mpsc::channel::<Arc<T>>(cap);
-                return Subscription { rx };
-            }
-        };
+        let entry = subs
+            .entry(type_id)
+            .or_insert_with(|| Box::new(InstanceIndex::<T>::default()) as Box<dyn Any + Send + Sync>);
         let (tx, rx) = mpsc::channel::<Arc<T>>(cap);
-        t.txs.push(tx);
-        Subscription { rx }
-    }
-    pub async fn subscribe_pattern<T: Send + Sync + 'static>(
-        &self,
-        pattern: Address,
-    ) -> Subscription<T> {
-        let mut patterns = self.inner.patterns.write().await;
-        let cap = self.inner.default_capacity;
-        let type_id = TypeId::of::<T>();
-        let list = patterns.entry(type_id).or_insert_with(Vec::new);
-        let (tx, rx) = mpsc::channel::<Arc<T>>(cap);
-        list.push(Box::new(PatternTopic::<T> {
-            pattern,
-            txs: SmallVec::from_vec(vec![tx]),
-        }) as Box<dyn Any + Send + Sync>);
+        let idx = entry.downcast_mut::<InstanceIndex<T>>().expect("instance index type");
+        if let Some(inst) = from.require_instance() {
+            idx.by_instance
+                .entry(inst)
+                .or_insert_with(SmallVec::new)
+                .push(tx);
+        } else {
+            idx.any.push(tx);
+        }
         Subscription { rx }
     }
     // 内部发送实现（统一入口）
     async fn publish_inner<T: Send + Sync + 'static>(&self, from: &ServiceAddr, msg: T) {
-        while self.inner.paused.load(Ordering::SeqCst) {
-            self.inner.resume_notify.notified().await;
-        }
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
-        let senders_exact: Option<Vec<mpsc::Sender<Arc<T>>>> = {
-            let topics = self.inner.topics.read().await;
-            if let Some(typed_map) = topics.get(from) {
-                if let Some(entry) = typed_map.get(&type_id) {
-                    if let Some(t) = entry.downcast_ref::<Topic<T>>() {
-                        Some(t.txs.to_vec())
-                    } else {
-                        tracing::error!("type mismatch in publish<T>: service/instance has a different message type");
-                        None
+        let senders: Vec<mpsc::Sender<Arc<T>>> = {
+            let subs = self.inner.subs.read();
+            if let Some(entry) = subs.get(&type_id) {
+                if let Some(idx) = entry.downcast_ref::<InstanceIndex<T>>() {
+                    let mut v: Vec<mpsc::Sender<Arc<T>>> = Vec::new();
+                    // 类型级订阅者
+                    v.extend(idx.any.iter().cloned());
+                    // 指定实例订阅者
+                    if let Some(inst_vec) = idx.by_instance.get(&from.instance) {
+                        v.extend(inst_vec.iter().cloned());
                     }
+                    v
                 } else {
-                    None
+                    tracing::error!("type mismatch in instance index for this type");
+                    Vec::new()
                 }
-            } else {
-                None
-            }
-        };
-        let senders_patterns: Vec<mpsc::Sender<Arc<T>>> = {
-            let patterns = self.inner.patterns.read().await;
-            if let Some(list) = patterns.get(&type_id) {
-                let mut all = Vec::new();
-                for entry in list {
-                    if let Some(pt) = entry.downcast_ref::<PatternTopic<T>>() {
-                        if pt.pattern.matches(from) {
-                            all.extend(pt.txs.iter().cloned());
-                        }
-                    } else {
-                        tracing::error!(
-                            "type mismatch in pattern list for this type; skipping entry"
-                        );
-                        continue;
-                    }
-                }
-                all
             } else {
                 Vec::new()
             }
         };
-        let mut total = 0usize;
-        if let Some(s) = &senders_exact {
-            total += s.iter().filter(|tx| !tx.is_closed()).count();
-        }
-        total += senders_patterns.iter().filter(|tx| !tx.is_closed()).count();
+    let total = senders.iter().filter(|tx| !tx.is_closed()).count();
         if total == 0 {
             return;
         }
-        // 单一路径：阻塞发送（不丢包）。保持最小必要队列，抵抗短暂抖动。
-        // total==1 快路径：不分配 recipients 容器
+        // total==1 快路径：避免额外分配
         if total == 1 {
-            if let Some(s) = &senders_exact {
-                if let Some(tx) = s.iter().find(|tx| !tx.is_closed()) {
-                    let _ = tx.send(arc).await;
-                    return;
-                }
-            }
-            // exact 没找到就一定在 patterns 中
-            if let Some(tx) = senders_patterns.iter().find(|tx| !tx.is_closed()) {
-                let _ = tx.send(arc).await;
-            }
-        } else {
-            // 统一收集所有仍然开启的接收者，最后一个使用 move，其余 clone，避免多余 Arc 克隆
-            let mut recipients: SmallVec<[&mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-            recipients.reserve(total);
-            if let Some(s) = &senders_exact {
-                for tx in s.iter() {
-                    if !tx.is_closed() {
-                        recipients.push(tx);
-                    }
-                }
-            }
-            for tx in &senders_patterns {
+            // 找到唯一一个仍打开的接收者
+            for tx in &senders {
                 if !tx.is_closed() {
-                    recipients.push(tx);
-                }
-            }
-            debug_assert_eq!(recipients.len(), total);
-            // 前 total-1 个 clone 发送，最后一个 move 发送
-            for i in 0..(total - 1) {
-                let _ = recipients[i].send(arc.clone()).await;
-            }
-            let _ = recipients[total - 1].send(arc).await;
-        }
-        // 按需清理：仅当检测到 sender 关闭或数量变化时进入写锁
-        let mut need_clean_topics = false;
-        let mut need_clean_patterns = false;
-        {
-            if let Some(s) = &senders_exact {
-                if s.iter().any(|tx| tx.is_closed()) {
-                    need_clean_topics = true;
-                }
-            }
-            if senders_patterns.iter().any(|tx| tx.is_closed()) {
-                need_clean_patterns = true;
-            }
-        }
-        if need_clean_topics {
-            let mut topics = self.inner.topics.write().await;
-            let mut remove_type = false;
-            let mut remove_service = false;
-            if let Some(typed_map) = topics.get_mut(from) {
-                if let Some(entry) = typed_map.get_mut(&type_id) {
-                    if let Some(t) = entry.downcast_mut::<Topic<T>>() {
-                        t.txs.retain(|tx| !tx.is_closed());
-                        if t.txs.is_empty() {
-                            remove_type = true;
+                    match tx.try_send(arc.clone()) {
+                        Ok(()) => return,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            let _ = tx.send(arc).await;
+                            return;
                         }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
-                if remove_type {
-                    typed_map.remove(&type_id);
-                }
-                if typed_map.is_empty() {
-                    remove_service = true;
-                }
             }
-            if remove_service {
-                topics.remove(from);
+            return;
+        }
+        // 多订阅者：收集仍然开启的接收者（拥有所有权，便于 try_send）
+    let mut recipients: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
+    // 依据 total 预留，减少重分配
+    recipients.reserve(total);
+        for tx in &senders {
+            if !tx.is_closed() {
+                recipients.push(tx.clone());
             }
         }
-        if need_clean_patterns {
-            let mut patterns = self.inner.patterns.write().await;
-            if let Some(list) = patterns.get_mut(&type_id) {
-                let mut new_list: Vec<Box<dyn Any + Send + Sync>> = Vec::with_capacity(list.len());
-                for mut entry in list.drain(..) {
-                    let keep = if let Some(ptm) = entry.downcast_mut::<PatternTopic<T>>() {
-                        ptm.txs.retain(|tx| !tx.is_closed());
-                        !ptm.txs.is_empty()
-                    } else {
-                        false
-                    };
-                    if keep {
-                        new_list.push(entry);
-                    }
+        if recipients.is_empty() { return; }
+        // try_send 快路径：先尽量非阻塞发送，剩余的再 await
+        let mut pending: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
+        for tx in recipients.into_iter() {
+            match tx.try_send(arc.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    pending.push(tx);
                 }
-                if new_list.is_empty() {
-                    patterns.remove(&type_id);
-                } else {
-                    *list = new_list;
-                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
+        }
+        if !pending.is_empty() {
+            let last = pending.len() - 1;
+            for i in 0..last {
+                let _ = pending[i].send(arc.clone()).await;
+            }
+            let _ = pending[last].send(arc).await;
         }
     }
     pub async fn publish<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
@@ -403,86 +265,25 @@ impl BusHandle {
     }
 
     #[cfg(test)]
-    pub async fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> (usize, usize) {
+    pub async fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
         let type_id = TypeId::of::<T>();
-        let topics = self.inner.topics.read().await;
-        let mut exact = 0usize;
-        for (_addr, typed_map) in topics.iter() {
-            if let Some(entry) = typed_map.get(&type_id) {
-                if let Some(t) = entry.downcast_ref::<Topic<T>>() {
-                    exact += t.txs.iter().filter(|tx| !tx.is_closed()).count();
+        let subs = self.inner.subs.read();
+        let mut n = 0usize;
+        if let Some(entry) = subs.get(&type_id) {
+            if let Some(idx) = entry.downcast_ref::<InstanceIndex<T>>() {
+                for vec in idx.by_instance.values() {
+                    n += vec.iter().filter(|tx| !tx.is_closed()).count();
                 }
             }
         }
-        drop(topics);
-        let patterns = self.inner.patterns.read().await;
-        let mut pat = 0usize;
-        if let Some(list) = patterns.get(&type_id) {
-            for entry in list {
-                if let Some(pt) = entry.downcast_ref::<PatternTopic<T>>() {
-                    pat += pt.txs.iter().filter(|tx| !tx.is_closed()).count();
-                }
-            }
-        }
-        (exact, pat)
+        n
     }
 }
 
-// 统一地址模型：一个类型同时表示精确地址与模式（通过 Option 实现）
+// 地址模型：通过 Option 表示“类型级（任意来源）”与“精确实例”两种路由目标
 
-// Backpressure 已移除：总线采用阻塞发送实现，确保不丢包（在队列容量范围内）。
+// 背压：基于有界 mpsc 队列 + try_send 优先，必要时 await；单订阅者快路径，小向量减少分配。
 
 // 已移除总线指标功能：简化核心总线实现。
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn wildcard_and_pattern_work() {
-        let bus = Bus::new(8);
-        let h = bus.handle();
-        struct S;
-        struct A;
-        struct B;
-        impl InstanceMarker for A {
-            fn id() -> &'static str {
-                "a"
-            }
-        }
-        impl InstanceMarker for B {
-            fn id() -> &'static str {
-                "b"
-            }
-        }
-        let a_exact = ServiceAddr::of_instance::<S, A>();
-        let b_exact = ServiceAddr::of_instance::<S, B>();
-        #[derive(Clone, Debug)]
-        struct Evt(u32);
-        let mut sub = h
-            .subscribe_pattern::<Evt>(Address {
-                service: Some(KindId::of::<S>()),
-                instance: None,
-            })
-            .await;
-        h.publish(
-            &Address {
-                service: Some(KindId::of::<S>()),
-                instance: Some(a_exact.instance.clone()),
-            },
-            Evt(1),
-        )
-        .await;
-        h.publish(
-            &Address {
-                service: Some(KindId::of::<S>()),
-                instance: Some(b_exact.instance.clone()),
-            },
-            Evt(2),
-        )
-        .await;
-        let x = sub.recv().await.unwrap();
-        let y = sub.recv().await.unwrap();
-        assert!(matches!((x.0, y.0), (1, 2) | (2, 1)));
-        // exact subscribe still works but is considered internal; here we check pattern only.
-    }
-}
+// (no internal tests here; covered by integration tests)

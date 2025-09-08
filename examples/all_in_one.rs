@@ -2,7 +2,7 @@
 //! - 唯一解耦路径：函数参数注入（上下文、消息、配置）
 //! - 统一注解模型（#[component]/#[handle]/#[active]）
 //! - 主动函数（#[active]）与被动订阅（#[handle]）
-//! - 过滤（from=ServiceType, instance=MarkerType）
+//! - 过滤：按实例字符串（#[handle(instance="id")]）
 //! - 强类型配置（app.config，#[init] 以 &Cfg 注入）
 
 use mmg_microbus::prelude::*;
@@ -52,8 +52,8 @@ impl Trader {
         self.cfg = Some(cfg.clone());
         Ok(())
     }
-    // 订阅来自 Feeder 的 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态）
-    #[mmg_microbus::handle(Tick, from=Feeder)]
+    // 订阅 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态）
+    #[mmg_microbus::handle]
     async fn on_tick(
         &mut self,
         ctx: &mmg_microbus::component::ComponentContext,
@@ -68,17 +68,25 @@ impl Trader {
         Ok(())
     }
 
-    // 只接收来自 Exchange::Binance 的价格；注入 &Price 与 &SymbolCfg
-    #[mmg_microbus::handle(Price, from=Exchange, instance=Binance)]
-    async fn on_price_binance(&mut self, price: &Price) -> anyhow::Result<()> {
+    // 只接收来自特定实例（binance）的价格；注入 &ComponentContext 与 &Price
+    #[mmg_microbus::handle(instance="binance")]
+    async fn on_price_binance(
+        &mut self,
+        _ctx: &mmg_microbus::component::ComponentContext,
+        price: &Price,
+    ) -> anyhow::Result<()> {
         let symbol = self.cfg.as_ref().map(|c| c.symbol.as_str()).unwrap_or("");
         tracing::info!(target = "example.all", symbol = %symbol, price = price.0);
         Ok(())
     }
 
     // 展示可选的 Ack 发布（匹配 Trader 类型的监听者）
-    #[mmg_microbus::handle(Price)]
-    async fn on_any_price(&mut self, _p: &Price) -> anyhow::Result<()> {
+    #[mmg_microbus::handle]
+    async fn on_any_price(
+        &mut self,
+        _ctx: &mmg_microbus::component::ComponentContext,
+        _p: &Price,
+    ) -> anyhow::Result<()> {
         // 这里不做过滤，任意来源价格都会触发
         Ok(())
     }

@@ -130,6 +130,7 @@ impl ComponentContext {
         };
         self.bus.publish(&me, msg).await;
     }
+    // 允许转发/桥接组件明确指定来源；请谨慎使用，建议仅在转发场景中使用。
     pub async fn publish_from<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
         self.bus.publish(from, msg).await;
     }
@@ -224,13 +225,32 @@ impl AutoTicker {
 
 // ---- crate 内部宏辅助 API（不暴露给业务）----
 #[doc(hidden)]
-pub async fn __subscribe_pattern_auto<T: Send + Sync + 'static>(
+pub async fn __subscribe_exact_auto<T: Send + Sync + 'static>(
     ctx: &ComponentContext,
-    pattern: Address,
+    instance: ComponentId,
 ) -> AutoSubscription<T> {
-    let sub = ctx.bus.subscribe_pattern::<T>(pattern).await;
+    let sub = ctx
+        .bus
+        .subscribe::<T>(&Address {
+            service: None,
+            instance: Some(instance),
+        })
+        .await;
     AutoSubscription {
         inner: sub,
         shutdown: ctx.shutdown.clone(),
     }
 }
+
+    #[doc(hidden)]
+    pub async fn __subscribe_any_auto<T: Send + Sync + 'static>(
+        ctx: &ComponentContext,
+    ) -> AutoSubscription<T> {
+        let sub = ctx.bus.subscribe::<T>(&Address::default()).await;
+        AutoSubscription {
+            inner: sub,
+            shutdown: ctx.shutdown.clone(),
+        }
+    }
+
+// (no extra internal publish helper)

@@ -75,20 +75,20 @@ fn component_for_impl(item: ItemImpl) -> TokenStream {
     generate_run_impl_inner(item, &self_ty)
 }
 
-// 移除旧的 #[configure] 宏：配置改为在 handler 签名中以 &CfgType 参数注入
+// 移除旧的 #[configure] 宏：配置改为在 handle 签名中以 &CfgType 参数注入
 
 // --- 方法即订阅（强类型，&T-only） + 生命周期钩子 ---
-// 用法：
-//   #[mmg_microbus::handles]
+// 用法（新）：
+//   #[mmg_microbus::component]
 //   impl MyComp {
-//       #[mmg_microbus::handle(Tick)]
-//       async fn on_tick(&mut self, tick: &Tick) -> anyhow::Result<()> { Ok(()) }
+//       #[mmg_microbus::handle]
+//       async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, tick: &Tick) -> anyhow::Result<()> { Ok(()) }
 //   }
-// 说明：仅支持消息参数为 `&T`，可选注入 `&ComponentContext`。不再支持 Envelope 或 ScopedBus 注入。
+// 说明：仅支持签名 (&ComponentContext, &T)，必须显式标注 #[handle]；#[handle] 仅用于实例过滤（instance/instances），不再支持 #[handle(T)] 旧语法。
 
 #[proc_macro_attribute]
 pub fn handle(_args: TokenStream, input: TokenStream) -> TokenStream {
-    // 标记型属性：保持方法体不变，由 #[handles] 在同一 impl 中解析。
+    // 标记型属性：保持方法体不变，由 #[component] 标注的 impl 扩展阶段统一解析。
     input
 }
 
@@ -105,164 +105,73 @@ pub fn stop(_args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
-    // 参数解析器：
-    // - #[handle(T)] 或 #[handle(T, from=ServiceType, instance=MarkerType)]
+    // 解析 #[handle(...)]：只允许 instance/instances 字段
     #[derive(Default, Clone)]
-    struct HandleAttr {
-        msg_ty: Option<Type>,
-        from_service: Option<Type>,
-        instance_str: Option<LitStr>,
-        instance_ty: Option<Type>,
-    }
-    struct HandleArgs {
-        msg_ty: Option<Type>,
-        from_service: Option<Type>,
-        instance_str: Option<LitStr>,
-        instance_ty: Option<Type>,
-    }
+    struct HandleAttr { instance_list: Vec<LitStr> }
+    struct HandleArgs { instance_list: Vec<LitStr> }
     impl Parse for HandleArgs {
         fn parse(input: ParseStream) -> syn::Result<Self> {
-            let mut msg_ty: Option<Type> = None;
-            let mut from_service: Option<Type> = None;
-            let mut instance_str: Option<LitStr> = None;
-            let mut instance_ty: Option<Type> = None;
-
-            // 尝试解析首个 Type（如果不是命名键值）
-            if !input.is_empty() {
-                let look_is_key = input.peek(Ident) && input.peek2(Token![=]);
-                if !look_is_key {
-                    msg_ty = Some(input.parse::<Type>()?);
-                    if input.peek(Token![,]) {
-                        let _c: Token![,] = input.parse()?;
-                    }
-                }
-            }
-            // 解析其后的逗号分隔命名参数
+            let mut instance_list: Vec<LitStr> = Vec::new();
             while !input.is_empty() {
-                if input.peek(Token![,]) {
-                    let _c: Token![,] = input.parse()?;
-                    if input.is_empty() {
-                        break;
-                    }
+                if input.peek(Token![,]) { let _c: Token![,] = input.parse()?; if input.is_empty() { break; } }
+                if !(input.peek(Ident) && input.peek2(Token![=])) {
+                    return Err(syn::Error::new(input.span(), "unknown or misplaced argument in #[handle(...)]"));
                 }
                 let key: Ident = input.parse()?;
                 let _eq: Token![=] = input.parse()?;
-                if key == "from" {
-                    from_service = Some(input.parse::<Type>()?);
-                } else if key == "instance" {
-                    // 允许字符串或类型标记
-                    if input.peek(LitStr) {
-                        instance_str = Some(input.parse::<LitStr>()?)
-                    } else {
-                        instance_ty = Some(input.parse::<Type>()?)
+                if key == "instance" {
+                    let lit: LitStr = input.parse()?; instance_list.push(lit);
+                } else if key == "instances" {
+                    let content; syn::bracketed!(content in input);
+                    while !content.is_empty() {
+                        let lit: LitStr = content.parse()?; instance_list.push(lit);
+                        if content.peek(Token![,]) { let _c: Token![,] = content.parse()?; }
                     }
                 } else {
                     return Err(syn::Error::new(key.span(), "unknown key in #[handle(..)]"));
                 }
-                if input.peek(Token![,]) {
-                    let _c: Token![,] = input.parse()?;
-                }
+                if input.peek(Token![,]) { let _c: Token![,] = input.parse()?; }
             }
-            Ok(HandleArgs {
-                msg_ty,
-                from_service,
-                instance_str,
-                instance_ty,
-            })
+            Ok(HandleArgs { instance_list })
         }
     }
-    fn parse_handle_attr(
-        a: &Attribute,
-    ) -> (Option<Type>, Option<Type>, Option<LitStr>, Option<Type>) {
-        match a.parse_args::<HandleArgs>() {
-            Ok(h) => (h.msg_ty, h.from_service, h.instance_str, h.instance_ty),
-            Err(_) => (None, None, None, None),
-        }
+    fn parse_handle_attr(a: &Attribute) -> Vec<LitStr> {
+        a.parse_args::<HandleArgs>().map(|h| h.instance_list).unwrap_or_default()
     }
 
     // 收集处理方法规范
-    struct MethodSpec {
-        ident: syn::Ident,
-        msg_ty: Type,
-        wants_ctx: bool,
-        pattern_tokens: proc_macro2::TokenStream,
-        ret_case: RetCase,
-        from_kind: Option<Type>,
-        instance_specified: bool,
-    }
-
+    struct MethodSpec { ident: syn::Ident, msg_ty: Type, wants_ctx: bool, instance_tokens: Vec<proc_macro2::TokenStream>, ret_case: RetCase }
     #[derive(Clone)]
-    enum RetCase {
-        Unit,
-        ResultUnit,
-        Some,
-        ResultSome,
-    }
-
+    enum RetCase { Unit, ResultUnit, Some, ResultSome }
     fn analyze_return(sig: &syn::Signature) -> RetCase {
         match &sig.output {
             syn::ReturnType::Default => RetCase::Unit,
-            syn::ReturnType::Type(_, ty) => {
-                match &**ty {
-                    syn::Type::Tuple(t) if t.elems.is_empty() => RetCase::Unit,
-                    syn::Type::Path(tp) => {
-                        let last = tp
-                            .path
-                            .segments
-                            .last()
-                            .map(|s| s.ident.to_string())
-                            .unwrap_or_default();
-                        if last == "Result" {
-                            // Extract first generic arg as Ok type
-                            if let Some(seg) = tp.path.segments.last() {
-                                if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
-                                    if let Some(syn::GenericArgument::Type(ok_ty)) = ab.args.first()
-                                    {
-                                        if let syn::Type::Tuple(t) = ok_ty {
-                                            if t.elems.is_empty() {
-                                                return RetCase::ResultUnit;
-                                            }
-                                        }
-                                        return RetCase::ResultSome;
-                                    }
+            syn::ReturnType::Type(_, ty) => match &**ty {
+                syn::Type::Tuple(t) if t.elems.is_empty() => RetCase::Unit,
+                syn::Type::Path(tp) => {
+                    let last = tp.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                    if last == "Result" {
+                        if let Some(seg) = tp.path.segments.last() {
+                            if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
+                                if let Some(syn::GenericArgument::Type(ok_ty)) = ab.args.first() {
+                                    if let syn::Type::Tuple(t) = ok_ty { if t.elems.is_empty() { return RetCase::ResultUnit; } }
+                                    return RetCase::ResultSome;
                                 }
                             }
-                            RetCase::ResultUnit
-                        } else {
-                            RetCase::Some
                         }
-                    }
-                    _ => RetCase::Some,
+                        RetCase::ResultUnit
+                    } else { RetCase::Some }
                 }
+                _ => RetCase::Some,
             }
         }
     }
-
-    // produced type extraction removed (no longer used for registry submissions)
-
     fn is_ctx_type(ty: &syn::Type) -> bool {
-        if let syn::Type::Reference(r) = ty {
-            if let syn::Type::Path(tp) = &*r.elem {
-                let last = tp
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
-                if last == "ComponentContext" {
-                    return true;
-                }
-            }
-        }
+        if let syn::Type::Reference(r) = ty { if let syn::Type::Path(tp) = &*r.elem { return tp.path.segments.last().map(|s| s.ident == "ComponentContext").unwrap_or(false); } }
         false
     }
-
     fn parse_msg_arg_ref(ty: &syn::Type) -> Option<Type> {
-        if let syn::Type::Reference(r) = ty {
-            if let syn::Type::Path(tp) = &*r.elem {
-                return Some(Type::Path(tp.clone()));
-            }
-        }
+        if let syn::Type::Reference(r) = ty { if let syn::Type::Path(tp) = &*r.elem { return Some(Type::Path(tp.clone())); } }
         None
     }
 
@@ -356,82 +265,61 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 if last.as_str() == "handle" {
                     has_handle_attr = true;
                     handle_attr_count += 1;
-                    let (m, f, i_str, i_ty) = parse_handle_attr(a);
-                    attr.msg_ty = m;
-                    attr.from_service = f;
-                    attr.instance_str = i_str;
-                    attr.instance_ty = i_ty;
+                    let instances = parse_handle_attr(a);
+                    attr.instance_list = instances;
                 }
             }
             if handle_attr_count > 1 {
                 compile_errors.push(quote! { compile_error!("a method can only have one #[handle(...)] attribute"); });
             }
             if has_handle_attr {
-                // 解析参数：仅允许可选注入 &ComponentContext 与恰好一个消息参数 &T
-                let mut wants_ctx = false;
-                let mut found_msg: Option<Type> = None;
-                let mut extra_params: Vec<Type> = Vec::new();
+                // 新规则：签名必须严格为 (&ComponentContext, &T)
+                let mut params: Vec<Type> = Vec::new();
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(pat_ty) = arg {
                         if is_ctx_type(&pat_ty.ty) {
-                            wants_ctx = true;
-                            continue;
+                            // ctx 优先识别
+                            params.push(syn::parse_quote!(__CTX_PLACEHOLDER__));
+                        } else if let Some(t) = parse_msg_arg_ref(&pat_ty.ty) {
+                            params.push(Type::Path(match t { Type::Path(tp) => tp, _ => unreachable!() }));
+                        } else {
+                            compile_errors.push(quote! { compile_error!("#[handle] method only allows (&ComponentContext, &T) parameters"); });
                         }
-                        if let Some(t) = parse_msg_arg_ref(&pat_ty.ty) {
-                            if found_msg.is_none() {
-                                found_msg = Some(t);
+                    }
+                }
+                // 过滤掉 receiver self，本身不计入；期望 params 精确包含 [ctx, msg]
+                if params.len() != 2 {
+                    compile_errors.push(quote! { compile_error!("#[handle] method must take exactly two parameters: (&ComponentContext, &T)"); });
+                    continue;
+                } else {
+                    // 检查顺序
+                    match (&params[0], &params[1]) {
+                        (Type::Path(tp0), Type::Path(tp1)) => {
+                            let is_ctx0 = tp0.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default() == "__CTX_PLACEHOLDER__";
+                            if is_ctx0 {
+                                let wants_ctx = true;
+                                let msg_ty = Type::Path(tp1.clone());
+                                // 生成过滤表达式：仅支持按实例字符串过滤；缺省为任意来源
+                                methods.push(MethodSpec {
+                                    ident: m.sig.ident.clone(),
+                                    msg_ty,
+                                    wants_ctx,
+                                    instance_tokens: attr.instance_list.iter().map(|lit| quote! { mmg_microbus::bus::ComponentId(#lit.to_string()) }).collect(),
+                                    ret_case: analyze_return(&m.sig),
+                                });
                             } else {
-                                // 出现第二个 &T 参数，违规：一个 handle 只能订阅一个消息类型
-                                extra_params.push(t);
+                                // 如果第一个不是 ctx，则不接受
+                                compile_errors.push(quote! { compile_error!("#[handle] parameters must be in order (&ComponentContext, &T)"); });
+                                continue;
                             }
                         }
+                        _ => {
+                            compile_errors.push(quote! { compile_error!("#[handle] method must take (&ComponentContext, &T)"); });
+                            continue;
+                        }
                     }
                 }
-                // 确定消息类型：优先从 &T 形参推断，否则从 #[handle(T)] 提供
-                let msg_ty = if let Some(t) = found_msg.clone() {
-                    t
-                } else if let Some(t) = attr.msg_ty.clone() {
-                    t
-                } else {
-                    compile_errors.push(quote! { compile_error!("#[handle] method must specify exactly one subscribed message type, either as a single &T parameter or as #[handle(T)]"); });
-                    continue;
-                };
-                // 校验是否有额外 &T 参数（除消息以外）
-                if !extra_params.is_empty() {
-                    compile_errors.push(quote! { compile_error!("#[handle] method can subscribe only one message type; found multiple &T parameters"); });
-                }
-
-                // 生成过滤表达式
-                let mut instance_specified = false;
-                let pattern_tokens = if let Some(from_ty) = attr.from_service.clone() {
-                    if let Some(_inst_str) = attr.instance_str.clone() {
-                        compile_errors.push(quote! { compile_error!("#[handle]: `instance` expects a marker type (impl InstanceMarker)"); });
-                        instance_specified = true;
-                        quote! { mmg_microbus::bus::Address::any() }
-                    } else if let Some(inst_ty) = attr.instance_ty.clone() {
-                        instance_specified = true;
-                        quote! { mmg_microbus::bus::Address::of_instance::<#from_ty, #inst_ty>() }
-                    } else {
-                        quote! { mmg_microbus::bus::Address::for_kind::<#from_ty>() }
-                    }
-                } else if attr.instance_str.is_some() || attr.instance_ty.is_some() {
-                    // 仅 instance 而缺少 from 类型：给出明确的编译期错误
-                    compile_errors.push(quote! { compile_error!("#[handle]: `instance = ...` requires also specifying `from = ServiceType`"); });
-                    quote! { mmg_microbus::bus::Address::any() }
-                } else {
-                    quote! { mmg_microbus::bus::Address::any() }
-                };
-
-                methods.push(MethodSpec {
-                    ident: m.sig.ident.clone(),
-                    msg_ty,
-                    wants_ctx,
-                    pattern_tokens,
-                    ret_case: analyze_return(&m.sig),
-                    from_kind: attr.from_service,
-                    instance_specified,
-                });
-            }
+            } // no else: 未标注 #[handle] 的方法视为普通方法
 
             // 处理 #[active]
             let mut is_active = false;
@@ -490,7 +378,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         }
     }
 
-    // 生成 run()：为每个 handler 创建订阅，并在 select 循环中分发
+    // 生成 run()：为每个 handle 创建订阅，并在 select 循环中分发
     // 收集 #[init] 与 #[stop]
     // #[init]: 仅允许 self + 可选一个 &CfgType；不允许 ctx 或多个配置
     let mut inits: Vec<(syn::Ident, Option<Type>, RetCase)> = Vec::new();
@@ -623,43 +511,77 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     let mut active_arms = Vec::new();
     let mut active_pre_immediate = Vec::new();
     for (idx, ms) in methods.iter().enumerate() {
-        let sub_var = format_ident!("__sub_{}", idx);
         let ty = &ms.msg_ty;
         let method_ident = &ms.ident;
-        let pattern = &ms.pattern_tokens;
-        sub_decls.push(quote! {
-            let mut #sub_var = mmg_microbus::component::__subscribe_pattern_auto::<#ty>(&ctx, #pattern).await;
-        });
-        // handle 仅支持可选 ctx 和单一消息 &T
-        let call_core = if ms.wants_ctx {
-            quote! { this.#method_ident(&ctx, &*env) }
-        } else {
-            quote! { this.#method_ident(&*env) }
-        };
+        if ms.instance_tokens.is_empty() {
+            // 订阅任意来源（类型级）
+            let sub_var = format_ident!("__sub_any_{}", idx);
+            sub_decls.push(quote! {
+                let mut #sub_var = mmg_microbus::component::__subscribe_any_auto::<#ty>(&ctx).await;
+            });
+            // handle 仅支持可选 ctx 和单一消息 &T
+            let call_core = if ms.wants_ctx {
+                quote! { this.#method_ident(&ctx, &*env) }
+            } else {
+                quote! { this.#method_ident(&*env) }
+            };
         // 根据返回类型自动处理发布：T / Result<T> 自动 publish；() / Result<()> 仅记录错误
-        let call_expr = match &ms.ret_case {
-            RetCase::Unit => quote! { let _ = #call_core.await; },
-            RetCase::ResultUnit => {
-                quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "handler returned error"); } }
-            }
-            RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
-            RetCase::ResultSome => {
-                quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "handler returned error") } }
-            }
-        };
-        select_arms.push(quote! {
-            msg = #sub_var.recv() => {
-                match msg {
-                    Some(env) => {
-                        { #call_expr }
-                    }
-                    None => { break; }
+            let call_expr = match &ms.ret_case {
+                RetCase::Unit => quote! { let _ = #call_core.await; },
+                RetCase::ResultUnit => {
+                    quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "handle returned error"); } }
                 }
+                RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
+                RetCase::ResultSome => {
+                    quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
+                }
+            };
+            select_arms.push(quote! {
+                msg = #sub_var.recv() => {
+                    match msg {
+                        Some(env) => {
+                            { #call_expr }
+                        }
+                        None => { break; }
+                    }
+                }
+            });
+        } else {
+            for (jdx, inst_tok) in ms.instance_tokens.iter().enumerate() {
+                let sub_var = format_ident!("__sub_{}_{}", idx, jdx);
+                sub_decls.push(quote! {
+                    let mut #sub_var = mmg_microbus::component::__subscribe_exact_auto::<#ty>(&ctx, #inst_tok).await;
+                });
+                let call_core = if ms.wants_ctx {
+                    quote! { this.#method_ident(&ctx, &*env) }
+                } else {
+                    quote! { this.#method_ident(&*env) }
+                };
+                let call_expr = match &ms.ret_case {
+                    RetCase::Unit => quote! { let _ = #call_core.await; },
+                    RetCase::ResultUnit => {
+                        quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "handle returned error"); } }
+                    }
+                    RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
+                    RetCase::ResultSome => {
+                        quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
+                    }
+                };
+                select_arms.push(quote! {
+                    msg = #sub_var.recv() => {
+                        match msg {
+                            Some(env) => {
+                                { #call_expr }
+                            }
+                            None => { break; }
+                        }
+                    }
+                });
             }
-        });
+        }
     }
 
-    // Generate active handlers
+    // Generate active loops
     for (idx, a) in actives.iter().enumerate() {
         let method_ident = &a.ident;
         // call core
@@ -753,39 +675,15 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         }
     };
 
-    // Emit route constraints for from=Type without instance
-    let mut route_constraints = Vec::new();
-    for ms in methods.iter() {
-        if let Some(ref fk) = ms.from_kind {
-            if !ms.instance_specified {
-                route_constraints.push(quote! {
-                    mmg_microbus::inventory::submit! { mmg_microbus::registry::RouteConstraint {
-                        consumer_ty: || std::any::type_name::<#self_ty>(),
-                        consumer_kind: || mmg_microbus::bus::KindId::of::<#self_ty>(),
-                        from_kind: || mmg_microbus::bus::KindId::of::<#fk>(),
-                    }}
-                });
-            }
-        }
-    }
     let expanded = quote! {
         #item
         #gen_run
-        #(#route_constraints)*
         #(#compile_errors)*
     };
     expanded.into()
 }
 
-#[proc_macro_attribute]
-pub fn handles(_args: TokenStream, _input: TokenStream) -> TokenStream {
-    syn::Error::new(
-        proc_macro2::Span::call_site(),
-        "`#[handles]` has been replaced by `#[component]` on impl blocks",
-    )
-    .to_compile_error()
-    .into()
-}
+// 已移除 #[handles]：旧的 impl 标注入口不再存在，请使用 #[component] 标注 struct 与 impl。
 
 /// Mark a method as proactive/active loop. Example:
 ///   #[active(interval_ms=1000)] async fn tick(&self, &Context, &Cfg) -> anyhow::Result<()>

@@ -15,7 +15,7 @@ struct Trader {
 #[mmg_microbus::component]
 impl Trader {
     // 只读 &T 形态
-    #[mmg_microbus::handle(Tick)]
+    #[mmg_microbus::handle]
     async fn on_tick_ro(
         &mut self,
         _ctx: &mmg_microbus::component::ComponentContext,
@@ -26,8 +26,8 @@ impl Trader {
         Ok(())
     }
 
-    // 只读负载形态（&T），带过滤：from=External, instance=ExtAccept
-    #[mmg_microbus::handle(Quote, from=External, instance=ExtAccept)]
+    // 只读负载形态（&T），带过滤：仅按实例字符串过滤
+    #[mmg_microbus::handle(instance="ext-accept")]
     async fn on_quote_filtered(
         &mut self,
         ctx: &mmg_microbus::component::ComponentContext,
@@ -57,7 +57,7 @@ async fn readonly_and_filters_work() {
 
     let h = app.bus_handle();
     let mut sub_ack = h
-        .subscribe_pattern::<Ack>(mmg_microbus::bus::Address::for_kind::<Trader>())
+        .subscribe::<Ack>(&mmg_microbus::bus::Address { service: None, instance: Some(mmg_microbus::bus::ComponentId("trader-1".to_string())) })
         .await;
 
     // 不匹配的 instance：不应收到 Ack
