@@ -62,7 +62,7 @@ impl Trader {
         let min_tick = self.cfg.as_ref().map(|c| c.min_tick).unwrap_or(0);
         if min_tick == 0 || tick.0 % min_tick == 0 {
             // 将 Tick 转换成 Price，并以 Exchange::Binance 身份发布
-            let from = mmg_microbus::bus::Address::of_instance::<Exchange, Binance>();
+            let from = mmg_microbus::bus::Address::of_instance::<Exchange>("binance");
             ctx.publish_from(&from, Price(tick.0 as f64)).await;
         }
         Ok(())
@@ -92,14 +92,8 @@ impl Trader {
     }
 }
 
-// ---- 服务与实例标记（用于过滤）----
+// ---- 服务（用于构建 service 类型）；实例使用字符串 ID ----
 struct Exchange;
-struct Binance;
-impl mmg_microbus::bus::InstanceMarker for Binance {
-    fn id() -> &'static str {
-        "binance"
-    }
-}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -119,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 从外部也可发布消息（使用 BusHandle）
     let bus = app.bus_handle();
-    let ext = mmg_microbus::bus::Address::of_instance::<Exchange, Binance>();
+    let ext = mmg_microbus::bus::Address::of_instance::<Exchange>("binance");
     bus.publish(&ext, Price(100.0)).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

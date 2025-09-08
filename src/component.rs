@@ -227,13 +227,13 @@ impl AutoTicker {
 #[doc(hidden)]
 pub async fn __subscribe_exact_auto<T: Send + Sync + 'static>(
     ctx: &ComponentContext,
-    instance: ComponentId,
+    instance: &str,
 ) -> AutoSubscription<T> {
     let sub = ctx
         .bus
         .subscribe::<T>(&Address {
             service: None,
-            instance: Some(instance),
+            instance: Some(ComponentId(instance.to_string())),
         })
         .await;
     AutoSubscription {

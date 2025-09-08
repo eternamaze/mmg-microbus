@@ -57,10 +57,11 @@ pub struct Address {
     pub instance: Option<ComponentId>,
 }
 impl Address {
-    pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
+    /// Build an exact address with typed service and string instance id.
+    pub fn of_instance<C: 'static>(id: &str) -> Self {
         Self {
             service: Some(KindId::of::<C>()),
-            instance: Some(ComponentId(I::id().to_string())),
+            instance: Some(ComponentId(id.to_string())),
         }
     }
     fn require_exact(&self) -> Option<ServiceAddr> {
@@ -77,17 +78,10 @@ impl Address {
     }
 }
 
-// 类型安全的实例标记：实现该 trait 的零尺寸类型可作为“实例 ID”，避免字符串契约与拼写错误
-pub trait InstanceMarker {
-    fn id() -> &'static str;
-}
-
 impl ServiceAddr {
-    pub fn of_instance<C: 'static, I: InstanceMarker>() -> Self {
-        ServiceAddr {
-            service: KindId::of::<C>(),
-            instance: ComponentId(I::id().to_string()),
-        }
+    /// Build an exact service address with typed service and string instance id.
+    pub fn of_instance<C: 'static>(id: &str) -> Self {
+        ServiceAddr { service: KindId::of::<C>(), instance: ComponentId(id.to_string()) }
     }
 }
 

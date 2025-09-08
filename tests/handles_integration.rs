@@ -55,13 +55,7 @@ async fn method_based_subscription_works() {
 
     // 从外部来源发布消息
     struct External;
-    struct Ext1;
-    impl mmg_microbus::bus::InstanceMarker for Ext1 {
-        fn id() -> &'static str {
-            "ext-1"
-        }
-    }
-    let ext = mmg_microbus::bus::Address::of_instance::<External, Ext1>();
+    let ext = mmg_microbus::bus::Address::of_instance::<External>("ext-1");
     h.publish(&ext, Price(1.0)).await;
     h.publish(&ext, Tick(1)).await;
 

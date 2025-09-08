@@ -41,12 +41,6 @@ impl Trader {
 }
 
 struct External;
-struct ExtAccept;
-impl mmg_microbus::bus::InstanceMarker for ExtAccept {
-    fn id() -> &'static str {
-        "ext-accept"
-    }
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn readonly_and_filters_work() {
@@ -61,13 +55,7 @@ async fn readonly_and_filters_work() {
         .await;
 
     // 不匹配的 instance：不应收到 Ack
-    struct ExtReject;
-    impl mmg_microbus::bus::InstanceMarker for ExtReject {
-        fn id() -> &'static str {
-            "ext-reject"
-        }
-    }
-    let ext_reject = mmg_microbus::bus::Address::of_instance::<External, ExtReject>();
+    let ext_reject = mmg_microbus::bus::Address::of_instance::<External>("ext-reject");
     h.publish(&ext_reject, Quote(1.0)).await;
     let no_ack = tokio::time::timeout(std::time::Duration::from_millis(50), sub_ack.recv())
         .await
@@ -76,7 +64,7 @@ async fn readonly_and_filters_work() {
     assert!(no_ack.is_none(), "unexpected ack for mismatched instance");
 
     // 匹配的 instance：应收到 Ack
-    let ext_accept = mmg_microbus::bus::Address::of_instance::<External, ExtAccept>();
+    let ext_accept = mmg_microbus::bus::Address::of_instance::<External>("ext-accept");
     h.publish(&ext_accept, Quote(2.0)).await;
     let ack = tokio::time::timeout(std::time::Duration::from_secs(1), sub_ack.recv())
         .await

@@ -136,9 +136,9 @@ app.config_many(|a| Box::pin(async move {
  - 运行期开关：不支持任何运行期开关（pause/resume 已移除）。
  
 
-## 强类型路由与订阅
+## 路由与订阅（字符串实例ID）
 - 唯一地址模型：`Address { service: Option<KindId>, instance: Option<ComponentId> }`
-- 精确地址：`Address::of_instance::<S, I>()`；类型级（任意来源）：省略实例过滤即可。
+- 精确地址：`Address::of_instance::<S>("instance-id")`；类型级（任意来源）：省略实例过滤即可。
 
 （内部机制）框架使用“类型级 + 精确实例”两级索引；业务代码无需直接调用订阅 API。
 
@@ -150,7 +150,7 @@ app.config_many(|a| Box::pin(async move {
   - 目标：声明主动函数的调度策略；由框架生成 ticker 驱动的循环。
   - 形参注入：仅可接受 `&ComponentContext`。
 - #[handle(instance="id")] / #[handle(instances=["a","b"]) ]
-  - 目标：为方法声明处理的消息类型与（可选）来源过滤；`Marker` 为实现了 `InstanceMarker` 的零尺寸类型。
+  - 目标：为方法声明处理的消息类型与（可选）来源过滤；实例使用字符串 ID。
   - 备注：当方法签名无法推断 T 时必须显式写 `T`。
 // 配置注入通过 #[init] 完成；#[handle]/#[active] 不支持 `&CfgType` 形参。
 

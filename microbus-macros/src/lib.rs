@@ -304,7 +304,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                                     ident: m.sig.ident.clone(),
                                     msg_ty,
                                     wants_ctx,
-                                    instance_tokens: attr.instance_list.iter().map(|lit| quote! { mmg_microbus::bus::ComponentId(#lit.to_string()) }).collect(),
+                                    instance_tokens: attr.instance_list.iter().map(|lit| quote! { #lit }).collect(),
                                     ret_case: analyze_return(&m.sig),
                                 });
                             } else {
