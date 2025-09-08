@@ -550,6 +550,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
 
     let gen_run = quote! {
         #[allow(unreachable_code)]
+        #[allow(deprecated)]
         #[async_trait::async_trait]
     impl mmg_microbus::component::Component for #self_ty {
             async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> anyhow::Result<()> {

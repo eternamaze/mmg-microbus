@@ -138,6 +138,7 @@ impl<T> AutoSubscription<T> {
 // 订阅：仅类型级（任意来源）
 
     #[doc(hidden)]
+    #[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
     pub async fn __subscribe_any_auto<T: Send + Sync + 'static>(ctx: &ComponentContext) -> AutoSubscription<T> {
         let sub = ctx.bus.subscribe_type::<T>().await;
         AutoSubscription { inner: sub }
@@ -145,18 +146,21 @@ impl<T> AutoSubscription<T> {
 
 // 发布：仅由宏在返回值场景调用；不对业务暴露
 #[doc(hidden)]
+#[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
 pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, msg: T) {
     ctx.bus.publish_type(msg).await;
 }
 
 /// 内部配置读取：仅供宏使用，防止业务侧滥用
 #[doc(hidden)]
+#[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
 pub fn __get_config<T: 'static + Send + Sync>(ctx: &ComponentContext) -> Option<Arc<T>> {
     ctx.cfg.get::<T>()
 }
 
 /// 内部停止信号（仅供宏生成的 run() 使用）
 #[doc(hidden)]
+#[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
 pub async fn __recv_stop(ctx: &ComponentContext) {
     let mut rx = ctx.stop.clone();
     let _ = rx.changed().await;
