@@ -3,7 +3,7 @@ name = "mmg-microbus"
 version = "1.0.0"
 edition = "2021"
 license = "MIT"
-description = "Typed microservice message bus and app runtime with precise routing (type-level and per-instance) and declarative auto-wiring."
+description = "Typed microservice message bus and app runtime with type-only routing and return-value publishing; strict signatures and framework-controlled stop."
 repository = "https://github.com/eternamaze/mmg-microbus"
 keywords = ["async", "tokio", "message-bus", "microservice", "pubsub"]
 categories = ["asynchronous", "network-programming"]
@@ -13,7 +13,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 async-trait = "0.1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-inventory = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
 smallvec = "1"

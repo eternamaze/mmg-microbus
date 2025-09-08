@@ -4,11 +4,13 @@ use mmg_microbus::prelude::*;
 struct Tick;
 
 #[mmg_microbus::component]
-struct C { id: mmg_microbus::bus::ComponentId }
+#[derive(Default)]
+struct C;
 
 #[mmg_microbus::component]
 impl C {
-    async fn on_tick(&mut self, _tick: &Tick) -> Result<()> { Ok(()) }
+    #[mmg_microbus::handle]
+    async fn on_tick(&mut self, _ctx: &mmg_microbus::component::ComponentContext, _tick: &Tick) -> Result<()> { Ok(()) }
 }
 
 fn main() {}

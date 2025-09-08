@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::Ident;
-use syn::{parse_macro_input, Attribute, Item, ItemImpl, ItemStruct, LitStr, Token, Type};
+use syn::{parse_macro_input, Attribute, Item, ItemImpl, ItemStruct, Token, Type};
 
 // 仅保留强类型“方法即订阅”路径。
 
@@ -23,33 +23,8 @@ pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn component_for_struct(item: ItemStruct, _args: proc_macro2::TokenStream) -> TokenStream {
     let struct_ident = &item.ident;
-    // Check fields; require `id` field
-    let mut has_id = false;
-    let mut init_fields: Vec<proc_macro2::TokenStream> = Vec::new();
-    if let syn::Fields::Named(fields) = &item.fields {
-        for f in &fields.named {
-            if let Some(fid) = &f.ident {
-                if fid == "id" {
-                    has_id = true;
-                    init_fields.push(quote! { id: id });
-                } else {
-                    // 其余字段统一用 Default::default() 初始化
-                    let name = fid;
-                    init_fields.push(quote! { #name: Default::default() });
-                }
-            }
-        }
-    }
-    if !has_id {
-        return syn::Error::new_spanned(
-            &item,
-            "#[component] requires a named field `id: ComponentId`",
-        )
-        .to_compile_error()
-        .into();
-    }
     let factory_ident = format_ident!("__{}Factory", struct_ident);
-    let build_body = quote! { Ok(Box::new(#struct_ident { #( #init_fields ),* })) };
+    let build_body = quote! { Ok(Box::new(<#struct_ident as Default>::default())) };
     let expanded = quote! {
         #item
         #[doc(hidden)]
@@ -105,44 +80,20 @@ pub fn stop(_args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
-    // 解析 #[handle(...)]：只允许 instance/instances 字段
+    // 解析 #[handle]：不允许任何参数
     #[derive(Default, Clone)]
-    struct HandleAttr { instance_list: Vec<LitStr> }
-    struct HandleArgs { instance_list: Vec<LitStr> }
-    impl Parse for HandleArgs {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            let mut instance_list: Vec<LitStr> = Vec::new();
-            while !input.is_empty() {
-                if input.peek(Token![,]) { let _c: Token![,] = input.parse()?; if input.is_empty() { break; } }
-                if !(input.peek(Ident) && input.peek2(Token![=])) {
-                    return Err(syn::Error::new(input.span(), "unknown or misplaced argument in #[handle(...)]"));
-                }
-                let key: Ident = input.parse()?;
-                let _eq: Token![=] = input.parse()?;
-                if key == "instance" {
-                    let lit: LitStr = input.parse()?; instance_list.push(lit);
-                } else if key == "instances" {
-                    let content; syn::bracketed!(content in input);
-                    while !content.is_empty() {
-                        let lit: LitStr = content.parse()?; instance_list.push(lit);
-                        if content.peek(Token![,]) { let _c: Token![,] = content.parse()?; }
-                    }
-                } else {
-                    return Err(syn::Error::new(key.span(), "unknown key in #[handle(..)]"));
-                }
-                if input.peek(Token![,]) { let _c: Token![,] = input.parse()?; }
-            }
-            Ok(HandleArgs { instance_list })
-        }
+    struct HandleAttr { has_args: bool }
+    fn parse_handle_attr(a: &Attribute) -> HandleAttr {
+        // 若存在任何 token，标记为非法
+        let has = !a.meta.require_path_only().is_ok();
+        HandleAttr { has_args: has }
     }
-    fn parse_handle_attr(a: &Attribute) -> Vec<LitStr> {
-        a.parse_args::<HandleArgs>().map(|h| h.instance_list).unwrap_or_default()
-    }
+    fn get_param_ident(p: &syn::Pat) -> Option<Ident> { if let syn::Pat::Ident(pi) = p { Some(pi.ident.clone()) } else { None } }
 
     // 收集处理方法规范
-    struct MethodSpec { ident: syn::Ident, msg_ty: Type, wants_ctx: bool, instance_tokens: Vec<proc_macro2::TokenStream>, ret_case: RetCase }
+    struct MethodSpec { ident: syn::Ident, msg_ty: Type, wants_ctx: bool, ret_case: RetCase }
     #[derive(Clone)]
-    enum RetCase { Unit, ResultUnit, Some, ResultSome }
+    enum RetCase { Unit, ResultUnit, Some, ResultSome, OptionSome, ResultOption }
     fn analyze_return(sig: &syn::Signature) -> RetCase {
         match &sig.output {
             syn::ReturnType::Default => RetCase::Unit,
@@ -155,12 +106,17 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                             if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
                                 if let Some(syn::GenericArgument::Type(ok_ty)) = ab.args.first() {
                                     if let syn::Type::Tuple(t) = ok_ty { if t.elems.is_empty() { return RetCase::ResultUnit; } }
+                                    // Result<Option<T>, E>
+                                    if let syn::Type::Path(ok_tp) = ok_ty {
+                                        let ok_last = ok_tp.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                                        if ok_last == "Option" { return RetCase::ResultOption; }
+                                    }
                                     return RetCase::ResultSome;
                                 }
                             }
                         }
                         RetCase::ResultUnit
-                    } else { RetCase::Some }
+                    } else if last == "Option" { RetCase::OptionSome } else { RetCase::Some }
                 }
                 _ => RetCase::Some,
             }
@@ -252,10 +208,9 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     for it in &item.items {
         if let syn::ImplItem::Fn(m) = it {
             // 处理 #[handle]
-            let mut attr = HandleAttr::default();
             let mut has_handle_attr = false;
             let mut handle_attr_count = 0usize;
-            for a in &m.attrs {
+        for a in &m.attrs {
                 let last = a
                     .path()
                     .segments
@@ -265,59 +220,40 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 if last.as_str() == "handle" {
                     has_handle_attr = true;
                     handle_attr_count += 1;
-                    let instances = parse_handle_attr(a);
-                    attr.instance_list = instances;
+            let parsed = parse_handle_attr(a);
+            if parsed.has_args { compile_errors.push(quote!{ compile_error!("#[handle] does not accept any arguments in this model"); }); }
                 }
             }
             if handle_attr_count > 1 {
                 compile_errors.push(quote! { compile_error!("a method can only have one #[handle(...)] attribute"); });
             }
             if has_handle_attr {
-                // 新规则：签名必须严格为 (&ComponentContext, &T)
-                let mut params: Vec<Type> = Vec::new();
+                // 放宽规则：允许可选 ctx；默认要求且仅允许一个业务 &T 参数。
+                let mut wants_ctx = false;
+                let mut candidates: Vec<(Option<Ident>, Type)> = Vec::new();
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(pat_ty) = arg {
-                        if is_ctx_type(&pat_ty.ty) {
-                            // ctx 优先识别
-                            params.push(syn::parse_quote!(__CTX_PLACEHOLDER__));
-                        } else if let Some(t) = parse_msg_arg_ref(&pat_ty.ty) {
-                            params.push(Type::Path(match t { Type::Path(tp) => tp, _ => unreachable!() }));
+                        if is_ctx_type(&pat_ty.ty) { wants_ctx = true; continue; }
+                        if let Some(t) = parse_msg_arg_ref(&pat_ty.ty) {
+                            let name = get_param_ident(&pat_ty.pat);
+                            candidates.push((name, t));
                         } else {
-                            compile_errors.push(quote! { compile_error!("#[handle] method only allows (&ComponentContext, &T) parameters"); });
+                            // 不支持其他参数（避免侵入）。
                         }
                     }
                 }
-                // 过滤掉 receiver self，本身不计入；期望 params 精确包含 [ctx, msg]
-                if params.len() != 2 {
-                    compile_errors.push(quote! { compile_error!("#[handle] method must take exactly two parameters: (&ComponentContext, &T)"); });
-                    continue;
-                } else {
-                    // 检查顺序
-                    match (&params[0], &params[1]) {
-                        (Type::Path(tp0), Type::Path(tp1)) => {
-                            let is_ctx0 = tp0.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default() == "__CTX_PLACEHOLDER__";
-                            if is_ctx0 {
-                                let wants_ctx = true;
-                                let msg_ty = Type::Path(tp1.clone());
-                                // 生成过滤表达式：仅支持按实例字符串过滤；缺省为任意来源
-                                methods.push(MethodSpec {
-                                    ident: m.sig.ident.clone(),
-                                    msg_ty,
-                                    wants_ctx,
-                                    instance_tokens: attr.instance_list.iter().map(|lit| quote! { #lit }).collect(),
-                                    ret_case: analyze_return(&m.sig),
-                                });
-                            } else {
-                                // 如果第一个不是 ctx，则不接受
-                                compile_errors.push(quote! { compile_error!("#[handle] parameters must be in order (&ComponentContext, &T)"); });
-                                continue;
-                            }
-                        }
-                        _ => {
-                            compile_errors.push(quote! { compile_error!("#[handle] method must take (&ComponentContext, &T)"); });
-                            continue;
-                        }
-                    }
+                let chosen_msg: Option<Type> = {
+                    if candidates.len() == 1 { Some(candidates[0].1.clone()) }
+                    else if candidates.is_empty() { compile_errors.push(quote! { compile_error!("#[handle] requires exactly one &T parameter (message payload)") }); None }
+                    else { compile_errors.push(quote! { compile_error!("#[handle] allows only one &T parameter; remove extras") }); None }
+                };
+                if let Some(msg_ty) = chosen_msg {
+                    methods.push(MethodSpec {
+                        ident: m.sig.ident.clone(),
+                        msg_ty,
+                        wants_ctx,
+                        ret_case: analyze_return(&m.sig),
+                    });
                 }
             } // no else: 未标注 #[handle] 的方法视为普通方法
 
@@ -380,10 +316,12 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
 
     // 生成 run()：为每个 handle 创建订阅，并在 select 循环中分发
     // 收集 #[init] 与 #[stop]
-    // #[init]: 仅允许 self + 可选一个 &CfgType；不允许 ctx 或多个配置
-    let mut inits: Vec<(syn::Ident, Option<Type>, RetCase)> = Vec::new();
-    // #[stop] 仅允许“仅 self”签名（&self 或 &mut self）；不允许 ctx 或任意额外参数
-    let mut stops: Vec<(syn::Ident, RetCase)> = Vec::new();
+    // #[init]: 允许 self + 可选 &ComponentContext + 恰好一个 &CfgType
+    struct InitSpec { ident: syn::Ident, wants_ctx: bool, cfg_ty: Option<Type>, ret_case: RetCase }
+    let mut inits: Vec<InitSpec> = Vec::new();
+    // #[stop]: 允许 self + 可选 &ComponentContext
+    struct StopSpec { ident: syn::Ident, wants_ctx: bool, ret_case: RetCase }
+    let mut stops: Vec<StopSpec> = Vec::new();
     for it in &item.items {
         if let syn::ImplItem::Fn(m) = it {
             let mut has_init = false;
@@ -403,39 +341,37 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 }
             }
             if has_init || has_stop {
-                // 收集 #[init] 的参数（支持 ctx 与若干 &CfgType）
+        // 收集 #[init] 的参数（严格：恰好一个 &CfgType；允许可选 ctx）
                 if has_init {
                     let mut cfg_ty: Option<Type> = None;
+                    let mut param_count = 0usize;
+            let mut wants_ctx = false;
                     let mut errors = Vec::new();
                     for arg in &m.sig.inputs {
                         if let syn::FnArg::Typed(pat_ty) = arg {
-                            if is_ctx_type(&pat_ty.ty) {
-                                errors.push(syn::Error::new_spanned(&m.sig, "#[init] method cannot take &ComponentContext; only self and optionally one &CfgType are allowed").to_compile_error());
-                                continue;
-                            }
+                if is_ctx_type(&pat_ty.ty) { wants_ctx = true; continue; }
                             if let Some(t) = parse_msg_arg_ref(&pat_ty.ty) {
-                                if cfg_ty.is_none() {
-                                    cfg_ty = Some(t);
-                                } else {
-                                    errors.push(syn::Error::new_spanned(&m.sig, "#[init] method can take at most one &CfgType parameter").to_compile_error());
-                                }
+                                param_count += 1;
+                                if cfg_ty.is_none() { cfg_ty = Some(t); } else { /* duplicated; counted */ }
                             } else {
-                                errors.push(syn::Error::new_spanned(&m.sig, "#[init] extra parameters are not allowed; expected at most one &CfgType").to_compile_error());
+                                errors.push(syn::Error::new_spanned(&m.sig, "#[init] parameter must be a single by-reference config type: &Cfg").to_compile_error());
                             }
                         }
                     }
-                    if !errors.is_empty() {
-                        compile_errors.extend(errors);
+                    if param_count != 1 {
+                        errors.push(syn::Error::new_spanned(&m.sig, "#[init] requires exactly one &Cfg parameter").to_compile_error());
                     }
+                    if !errors.is_empty() { compile_errors.extend(errors); }
                     let rc = analyze_return(&m.sig);
-                    inits.push((m.sig.ident.clone(), cfg_ty.clone(), rc));
+            inits.push(InitSpec { ident: m.sig.ident.clone(), wants_ctx, cfg_ty: cfg_ty.clone(), ret_case: rc });
                 }
                 // 校验 #[stop]：只允许接收器（&self 或 &mut self），不允许其他参数
                 if has_stop {
-                    let mut extraneous = Vec::new();
+            let mut extraneous = Vec::new();
+            let mut wants_ctx = false;
                     for arg in &m.sig.inputs {
                         if let syn::FnArg::Typed(p) = arg {
-                            extraneous.push(p.ty.clone());
+                if is_ctx_type(&p.ty) { wants_ctx = true; } else { extraneous.push(p.ty.clone()); }
                         }
                     }
                     if !extraneous.is_empty() {
@@ -446,7 +382,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                         compile_errors.push(err.to_compile_error());
                     } else {
                         let rc = analyze_return(&m.sig);
-                        stops.push((m.sig.ident.clone(), rc));
+            stops.push(StopSpec { ident: m.sig.ident.clone(), wants_ctx, ret_case: rc });
                     }
                 }
             }
@@ -455,51 +391,54 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
 
     // 生成 init/stop 调用代码
     let mut init_calls = Vec::new();
-    for (ident, cfg_opt, rc) in inits.iter() {
-        let call_expr = if let Some(cty) = cfg_opt {
+    for i in inits.iter() {
+        let ident = &i.ident;
+        let call_expr = if let Some(cty) = &i.cfg_ty {
             let var = format_ident!("__icfg_{}", ident);
-            let call_core = quote! { this.#ident(&*#var) };
+            // 严格：恰好一个 &Cfg 参数，且可选 ctx
+            let call_core = if i.wants_ctx { quote! { this.#ident(&ctx, &*#var) } } else { quote! { this.#ident(&*#var) } };
+            let rc = &i.ret_case;
             let ret = match rc {
                 RetCase::Unit => quote! { let _ = #call_core.await; },
                 RetCase::ResultUnit => {
                     quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "init returned error"); } }
                 }
-                RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
+                RetCase::Some => quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } },
+                RetCase::OptionSome => quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } },
                 RetCase::ResultSome => {
-                    quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "init returned error") } }
+                    quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "init returned error") } }
+                }
+                RetCase::ResultOption => {
+                    quote! { match #call_core.await { Ok(opt) => if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e) => tracing::warn!(error=?e, "init returned error") } }
                 }
             };
             quote! {{
-                let #var = ctx.config::<#cty>();
-                if let Some(#var) = #var { #ret } else { tracing::error!("missing config for init"); }
+                let #var = mmg_microbus::component::__get_config::<#cty>(&ctx);
+                if let Some(#var) = #var { #ret } else { return Err(anyhow::anyhow!(concat!("missing config for init: ", stringify!(#cty)))); }
             }}
         } else {
-            let call_core = quote! { this.#ident() };
-            let ret = match rc {
-                RetCase::Unit => quote! { let _ = #call_core.await; },
-                RetCase::ResultUnit => {
-                    quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "init returned error"); } }
-                }
-                RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
-                RetCase::ResultSome => {
-                    quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "init returned error") } }
-                }
-            };
-            quote! {{ #ret }}
+            // 不应出现：#[init] 必须提供一个 &CfgType；若宏到此仍无类型，静默不生成调用。
+            quote! {}
         };
         init_calls.push(call_expr);
     }
     let mut stop_calls = Vec::new();
-    for (ident, rc) in stops.iter() {
-        let call_core = quote! { this.#ident() };
+    for s in stops.iter() {
+        let ident = &s.ident;
+        let call_core = if s.wants_ctx { quote! { this.#ident(&ctx) } } else { quote! { this.#ident() } };
+        let rc = &s.ret_case;
         let call_expr = match rc {
             RetCase::Unit => quote! { let _ = #call_core.await; },
             RetCase::ResultUnit => {
                 quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "stop returned error"); } }
             }
-            RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
+            RetCase::Some => quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } },
+            RetCase::OptionSome => quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } },
             RetCase::ResultSome => {
-                quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "stop returned error") } }
+                quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "stop returned error") } }
+            }
+            RetCase::ResultOption => {
+                quote! { match #call_core.await { Ok(opt) => if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e) => tracing::warn!(error=?e, "stop returned error") } }
             }
         };
         stop_calls.push(quote! {{ #call_expr }});
@@ -513,7 +452,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     for (idx, ms) in methods.iter().enumerate() {
         let ty = &ms.msg_ty;
         let method_ident = &ms.ident;
-        if ms.instance_tokens.is_empty() {
+    {
             // 订阅任意来源（类型级）
             let sub_var = format_ident!("__sub_any_{}", idx);
             sub_decls.push(quote! {
@@ -531,9 +470,13 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 RetCase::ResultUnit => {
                     quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "handle returned error"); } }
                 }
-                RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
+                RetCase::Some => quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } },
+                RetCase::OptionSome => quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } },
                 RetCase::ResultSome => {
-                    quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
+                    quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
+                }
+                RetCase::ResultOption => {
+                    quote! { match #call_core.await { Ok(opt) => if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
                 }
             };
             select_arms.push(quote! {
@@ -546,39 +489,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                     }
                 }
             });
-        } else {
-            for (jdx, inst_tok) in ms.instance_tokens.iter().enumerate() {
-                let sub_var = format_ident!("__sub_{}_{}", idx, jdx);
-                sub_decls.push(quote! {
-                    let mut #sub_var = mmg_microbus::component::__subscribe_exact_auto::<#ty>(&ctx, #inst_tok).await;
-                });
-                let call_core = if ms.wants_ctx {
-                    quote! { this.#method_ident(&ctx, &*env) }
-                } else {
-                    quote! { this.#method_ident(&*env) }
-                };
-                let call_expr = match &ms.ret_case {
-                    RetCase::Unit => quote! { let _ = #call_core.await; },
-                    RetCase::ResultUnit => {
-                        quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "handle returned error"); } }
-                    }
-                    RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
-                    RetCase::ResultSome => {
-                        quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
-                    }
-                };
-                select_arms.push(quote! {
-                    msg = #sub_var.recv() => {
-                        match msg {
-                            Some(env) => {
-                                { #call_expr }
-                            }
-                            None => { break; }
-                        }
-                    }
-                });
-            }
-        }
+    }
     }
 
     // Generate active loops
@@ -595,9 +506,13 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
             RetCase::ResultUnit => {
                 quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "active returned error"); } }
             }
-            RetCase::Some => quote! { { let __v = #call_core.await; ctx.publish(__v).await; } },
+            RetCase::Some => quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } },
+            RetCase::OptionSome => quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } },
             RetCase::ResultSome => {
-                quote! { match #call_core.await { Ok(v) => ctx.publish(v).await, Err(e) => tracing::warn!(error=?e, "active returned error") } }
+                quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "active returned error") } }
+            }
+            RetCase::ResultOption => {
+                quote! { match #call_core.await { Ok(opt) => if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e) => tracing::warn!(error=?e, "active returned error") } }
             }
         };
         // declarations: counters and done flags
@@ -615,39 +530,28 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 quote! { if !#done { { #call_expr } #cnt = #cnt.saturating_add(1); #times_limit } },
             );
         }
-        // ticker if interval specified
+        // interval 驱动：使用内部 sleep + 停止信号的选择，而不是上下文协作 API。
         if let Some(ms) = a.interval_ms {
             if ms > 0 {
-                let tk = format_ident!("__active_ticker_{}", idx);
-                active_decls.push(
-                    quote! { let mut #tk = ctx.ticker(std::time::Duration::from_millis(#ms)); },
-                );
                 let times_limit = if let Some(n) = a.times {
                     quote! { if #cnt >= #n { #done = true; } }
-                } else {
-                    quote! {}
-                };
+                } else { quote! {} };
+                let dur = proc_macro2::Literal::u64_unsuffixed(ms);
                 active_arms.push(quote! {
-                    __tick = #tk.tick(), if !#done => {
-                        match __tick {
-                            None => { break; }
-                            Some(()) => {
-                                { #call_expr }
-                                #cnt = #cnt.saturating_add(1);
-                                #times_limit
-                            }
-                        }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(#dur)), if !#done => {
+                        { #call_expr }
+                        #cnt = #cnt.saturating_add(1);
+                        #times_limit
                     }
                 });
             }
-        } // end if ms
+        }
     }
 
     let gen_run = quote! {
         #[allow(unreachable_code)]
         #[async_trait::async_trait]
     impl mmg_microbus::component::Component for #self_ty {
-            fn id(&self) -> &mmg_microbus::bus::ComponentId { &self.id }
             async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> anyhow::Result<()> {
                 let mut this = *self;
         // 初始化阶段：调用 #[init] 标注的方法
@@ -660,12 +564,12 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         #(#active_pre_immediate)*
                 // 组件类型 KindId
                 let __kind_id = mmg_microbus::bus::KindId::of::<#self_ty>();
-                // 主循环：各类型订阅自动随停（无显式 shutdown 分支）
-        loop {
+                // 主循环：选择消息、主动任务与框架停机信号；收到停机信号即退出。
+                loop {
                     tokio::select! {
                         #(#select_arms)*
-            #(#active_arms)*
-            _ = ctx.graceful_sleep(std::time::Duration::from_secs(3600)) => { break; }
+                        #(#active_arms)*
+                        _ = mmg_microbus::component::__recv_stop(&ctx) => { break; }
                     }
                 }
         // 停止阶段：调用 #[stop] 标注的方法

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::any::{Any, TypeId};
+use std::any::TypeId;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -13,7 +13,7 @@ pub struct App {
     bus: Bus,
     tasks: Vec<JoinHandle<()>>,
     started: bool,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stop_tx: tokio::sync::watch::Sender<bool>,
     factories: std::collections::HashMap<
         crate::bus::KindId,
         std::sync::Arc<dyn crate::component::ComponentFactory>,
@@ -24,24 +24,21 @@ pub struct App {
         std::sync::Arc<dyn std::any::Any + Send + Sync>,
     >,
     frozen_cfg: Option<ConfigStore>,
-    // 记录框架配置是否已设置过，用于重复设置时发出覆盖警告
-    app_cfg_set: bool,
 }
 
 impl App {
     pub fn new(cfg: AppConfig) -> Self {
         let bus = Bus::new(cfg.queue_capacity);
-        let (tx, _rx) = tokio::sync::watch::channel(false);
+    let (tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             cfg,
             bus,
             tasks: Vec::new(),
             started: false,
-            shutdown_tx: tx,
+            stop_tx: tx,
             factories: std::collections::HashMap::new(),
             cfg_map: std::collections::HashMap::new(),
             frozen_cfg: None,
-            app_cfg_set: false,
         }
     }
 
@@ -64,7 +61,7 @@ impl App {
 
     /// 配置入口（单项）：
     /// - 传入任意业务配置类型，按类型存入只读配置仓库，供 #[init] 形参按 &T 自动注入。
-    /// - 传入框架配置类型（如 AppConfig）会被框架消费并应用到 App 本身，不进入业务配置仓库。
+    /// - 不再识别或消费框架配置类型（例如 AppConfig）；框架配置仅在 `App::new(AppConfig)` 提供。
     /// - 可多次调用以注入多种类型。
     /// - 仅在启动前允许；启动后不支持动态更新。
     pub async fn config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
@@ -73,25 +70,12 @@ impl App {
             tracing::warn!(config_type = %std::any::type_name::<T>(), "config called after start(); ignoring");
             return Ok(self);
         }
-        if TypeId::of::<T>() == TypeId::of::<AppConfig>() {
-            let any_box: Box<dyn Any + Send + Sync> = Box::new(cfg);
-            match any_box.downcast::<AppConfig>() {
-                Ok(b) => {
-                    self.set_app_config(*b);
-                }
-                Err(_) => {
-                    debug_assert!(false, "TypeId matched AppConfig but downcast failed");
-                    return Ok(self);
-                }
-            }
-        } else {
-            let tid = TypeId::of::<T>();
-            if self.cfg_map.contains_key(&tid) {
-                tracing::warn!(config_type = %std::any::type_name::<T>(), "config for this type provided multiple times before start; overriding");
-            }
-            let entry = std::sync::Arc::new(cfg) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
-            self.cfg_map.insert(tid, entry);
+        let tid = TypeId::of::<T>();
+        if self.cfg_map.contains_key(&tid) {
+            tracing::warn!(config_type = %std::any::type_name::<T>(), "config for this type provided multiple times before start; overriding");
         }
+        let entry = std::sync::Arc::new(cfg) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
+        self.cfg_map.insert(tid, entry);
         Ok(self)
     }
     /// 批量配置入口（闭包）：仅为 `config` 的薄包装器，调用方提供一个异步闭包，内部按序调用 `self.config(...)`。
@@ -116,24 +100,7 @@ impl App {
         Ok(self)
     }
 
-    fn apply_app_config(&mut self, cfg: AppConfig) {
-        // 合并策略：直接覆盖为最新值（队列容量/停机等待/组件列表）。
-        // 组件列表通常通过 add_component 维护；如通过 AppConfig 提供，也予以接纳。
-        self.cfg = cfg.clone();
-        self.bus = Bus::new(self.cfg.queue_capacity);
-    }
-    /// 设置框架配置的专用通道，避免和业务配置混用。
-    pub fn set_app_config(&mut self, cfg: AppConfig) {
-        if self.started {
-            tracing::warn!("set_app_config called after start(); ignoring");
-            return;
-        }
-        if self.app_cfg_set {
-            tracing::warn!("AppConfig provided multiple times before start; overriding previous values");
-        }
-        self.app_cfg_set = true;
-        self.apply_app_config(cfg);
-    }
+    // 框架配置仅能在 new() 时提供；运行期不支持修改。
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
             return Ok(());
@@ -170,7 +137,7 @@ impl App {
             let id = cc.id.clone();
             let bus_handle = handle.clone();
             let kind_id = factory.kind_id();
-            let rx = self.shutdown_tx.subscribe();
+            let rx = self.stop_tx.subscribe();
             let cfg_store_i = cfg_store.clone();
             let fut = async move {
                 let built = factory
@@ -202,12 +169,15 @@ impl App {
         Ok(())
     }
     pub async fn stop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
-        // 等待所有组件任务自然退出（组件应响应 shutdown 信号或在 run 中 break）
+        // 框架主导的单方面停机：
+        // 1) 发出停止信号；
+        let _ = self.stop_tx.send(true);
+        // 2) 强制结束所有组件任务（无需等待其“自然退出”）。
         let mut rest = Vec::new();
         rest.append(&mut self.tasks);
         for h in rest.into_iter() {
-            let _ = h.await; // 忽略错误（如任务自行返回 Err）
+            // 组件 run() 应该在收到停止后尽快返回；这里直接等待一次 join，若 panic/取消也忽略。
+            let _ = h.await;
         }
         self.started = false;
     }

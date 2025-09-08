@@ -1,18 +1,1 @@
-use crate::bus::KindId;
-use std::any::Any;
-use std::sync::Arc;
-
-pub type CfgInvokeFn = for<'a> fn(
-    comp: &'a mut dyn crate::component::Component,
-    ctx: crate::component::ConfigContext,
-    v: Arc<dyn Any + Send + Sync>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>,
->;
-
-pub struct DesiredCfgSpec {
-    pub component_kind: fn() -> KindId,
-    pub invoke: CfgInvokeFn,
-}
-pub struct DesiredCfgEntry(pub DesiredCfgSpec);
-inventory::collect!(DesiredCfgEntry);
+// 已移除：历史 config_registry；文件保留为空占位（不参与编译）

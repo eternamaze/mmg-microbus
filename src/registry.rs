@@ -1,3 +1,1 @@
-// registry placeholder: no public registries in current design
-
-// No runtime route constraints in the new design.
+// 已移除：历史 registry 占位；文件保留为空（不参与编译）

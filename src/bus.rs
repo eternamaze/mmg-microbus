@@ -6,10 +6,10 @@ use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt,
-    hash::{Hash, Hasher},
+    hash::Hash,
     sync::Arc,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use parking_lot::RwLock;
 
 
@@ -26,64 +26,7 @@ impl fmt::Debug for KindId {
     }
 }
 
-#[derive(Clone, Eq)]
-pub struct ServiceAddr {
-    pub service: KindId,
-    pub instance: ComponentId,
-}
-impl PartialEq for ServiceAddr {
-    fn eq(&self, other: &Self) -> bool {
-        self.service == other.service && self.instance == other.instance
-    }
-}
-impl Hash for ServiceAddr {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.service.hash(state);
-        self.instance.hash(state);
-    }
-}
-impl fmt::Debug for ServiceAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ServiceAddr")
-            .field("service", &self.service)
-            .field("instance", &self.instance)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Address {
-    pub service: Option<KindId>,
-    pub instance: Option<ComponentId>,
-}
-impl Address {
-    /// Build an exact address with typed service and string instance id.
-    pub fn of_instance<C: 'static>(id: &str) -> Self {
-        Self {
-            service: Some(KindId::of::<C>()),
-            instance: Some(ComponentId(id.to_string())),
-        }
-    }
-    fn require_exact(&self) -> Option<ServiceAddr> {
-        match (&self.service, &self.instance) {
-            (Some(s), Some(i)) => Some(ServiceAddr {
-                service: *s,
-                instance: i.clone(),
-            }),
-            _ => None,
-        }
-    }
-    fn require_instance(&self) -> Option<ComponentId> {
-        self.instance.clone()
-    }
-}
-
-impl ServiceAddr {
-    /// Build an exact service address with typed service and string instance id.
-    pub fn of_instance<C: 'static>(id: &str) -> Self {
-        ServiceAddr { service: KindId::of::<C>(), instance: ComponentId(id.to_string()) }
-    }
-}
+// 地址模型已移除：仅按消息类型进行路由
 
 pub struct Subscription<T> {
     rx: mpsc::Receiver<Arc<T>>,
@@ -92,29 +35,14 @@ impl<T> Subscription<T> {
     pub async fn recv(&mut self) -> Option<Arc<T>> {
         self.rx.recv().await
     }
-    /// Receive next message or end on shutdown. When the shutdown receiver signals, returns None.
-    pub async fn recv_or_shutdown(&mut self, shutdown: &watch::Receiver<bool>) -> Option<Arc<T>> {
-        let mut sd = shutdown.clone();
-        tokio::select! {
-            _ = sd.changed() => {
-                None
-            }
-            msg = self.rx.recv() => {
-                msg
-            }
-        }
-    }
 }
 
-// 订阅索引：支持类型级（any）与按实例聚合
-struct InstanceIndex<T: Send + Sync + 'static> {
+// 订阅索引：仅类型级（any-of-type）
+struct TypeIndex<T: Send + Sync + 'static> {
     any: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
-    by_instance: HashMap<ComponentId, SmallVec<[mpsc::Sender<Arc<T>>; 4]>>,
 }
-impl<T: Send + Sync + 'static> Default for InstanceIndex<T> {
-    fn default() -> Self {
-        Self { any: SmallVec::new(), by_instance: HashMap::new() }
-    }
+impl<T: Send + Sync + 'static> Default for TypeIndex<T> {
+    fn default() -> Self { Self { any: SmallVec::new() } }
 }
 
 #[derive(Clone)]
@@ -132,9 +60,8 @@ impl fmt::Debug for BusHandle {
         f.debug_struct("BusHandle").finish()
     }
 }
-impl BusHandle {}
 
-// 路由索引：类型级(any-of-type) 与 精确实例 两级
+// 路由索引：仅类型级（any-of-type），不支持实例级寻址
 
 pub struct Bus {
     handle: BusHandle,
@@ -157,43 +84,31 @@ impl Bus {
 }
 
 impl BusHandle {
-    pub async fn subscribe<T: Send + Sync + 'static>(&self, from: &Address) -> Subscription<T> {
+    pub(crate) async fn subscribe_type<T: Send + Sync + 'static>(&self) -> Subscription<T> {
         let mut subs = self.inner.subs.write();
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
         let entry = subs
             .entry(type_id)
-            .or_insert_with(|| Box::new(InstanceIndex::<T>::default()) as Box<dyn Any + Send + Sync>);
+            .or_insert_with(|| Box::new(TypeIndex::<T>::default()) as Box<dyn Any + Send + Sync>);
         let (tx, rx) = mpsc::channel::<Arc<T>>(cap);
-        let idx = entry.downcast_mut::<InstanceIndex<T>>().expect("instance index type");
-        if let Some(inst) = from.require_instance() {
-            idx.by_instance
-                .entry(inst)
-                .or_insert_with(SmallVec::new)
-                .push(tx);
-        } else {
-            idx.any.push(tx);
-        }
+        let idx = entry.downcast_mut::<TypeIndex<T>>().expect("type index");
+        idx.any.push(tx);
         Subscription { rx }
     }
     // 内部发送实现（统一入口）
-    async fn publish_inner<T: Send + Sync + 'static>(&self, from: &ServiceAddr, msg: T) {
+    pub(crate) async fn publish_type<T: Send + Sync + 'static>(&self, msg: T) {
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
         let senders: Vec<mpsc::Sender<Arc<T>>> = {
             let subs = self.inner.subs.read();
             if let Some(entry) = subs.get(&type_id) {
-                if let Some(idx) = entry.downcast_ref::<InstanceIndex<T>>() {
+                if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
                     let mut v: Vec<mpsc::Sender<Arc<T>>> = Vec::new();
-                    // 类型级订阅者
                     v.extend(idx.any.iter().cloned());
-                    // 指定实例订阅者
-                    if let Some(inst_vec) = idx.by_instance.get(&from.instance) {
-                        v.extend(inst_vec.iter().cloned());
-                    }
                     v
                 } else {
-                    tracing::error!("type mismatch in instance index for this type");
+                    tracing::error!("type mismatch in type index for this type");
                     Vec::new()
                 }
             } else {
@@ -204,9 +119,9 @@ impl BusHandle {
         if total == 0 {
             return;
         }
-        // total==1 快路径：避免额外分配
+    // 单订阅者快路径：避免不必要的分配
         if total == 1 {
-            // 找到唯一一个仍打开的接收者
+            // 找到唯一仍打开的接收者
             for tx in &senders {
                 if !tx.is_closed() {
                     match tx.try_send(arc.clone()) {
@@ -221,9 +136,9 @@ impl BusHandle {
             }
             return;
         }
-        // 多订阅者：收集仍然开启的接收者（拥有所有权，便于 try_send）
+    // 多订阅者：收集仍然开启的接收者（转移所有权以便 try_send）
     let mut recipients: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-    // 依据 total 预留，减少重分配
+    // 依据 total 预留容量，减少重分配
     recipients.reserve(total);
         for tx in &senders {
             if !tx.is_closed() {
@@ -231,7 +146,7 @@ impl BusHandle {
             }
         }
         if recipients.is_empty() { return; }
-        // try_send 快路径：先尽量非阻塞发送，剩余的再 await
+    // try_send 快路径：优先非阻塞发送，剩余的再 await
         let mut pending: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
         for tx in recipients.into_iter() {
             match tx.try_send(arc.clone()) {
@@ -250,34 +165,25 @@ impl BusHandle {
             let _ = pending[last].send(arc).await;
         }
     }
-    pub async fn publish<T: Send + Sync + 'static>(&self, from: &Address, msg: T) {
-        if let Some(ex) = from.require_exact() {
-            self.publish_inner::<T>(&ex, msg).await;
-        } else {
-            tracing::warn!("publish<T> ignored: Address must be exact (service+instance)");
-        }
-    }
+    // 发布接口不对外暴露；仅供宏生成代码内部使用
 
     #[cfg(test)]
     pub async fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
         let type_id = TypeId::of::<T>();
         let subs = self.inner.subs.read();
-        let mut n = 0usize;
         if let Some(entry) = subs.get(&type_id) {
-            if let Some(idx) = entry.downcast_ref::<InstanceIndex<T>>() {
-                for vec in idx.by_instance.values() {
-                    n += vec.iter().filter(|tx| !tx.is_closed()).count();
-                }
+            if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
+                return idx.any.iter().filter(|tx| !tx.is_closed()).count();
             }
         }
-        n
+        0
     }
 }
 
-// 地址模型：通过 Option 表示“类型级（任意来源）”与“精确实例”两种路由目标
+// 地址模型：已移除；仅类型级路由
 
-// 背压：基于有界 mpsc 队列 + try_send 优先，必要时 await；单订阅者快路径，小向量减少分配。
+// 背压策略：有界 mpsc + try_send 优先，必要时 await；单订阅者快路径；SmallVec 降低分配成本。
 
-// 已移除总线指标功能：简化核心总线实现。
+// 指标采集已移除：保持总线实现最小化
 
-// (no internal tests here; covered by integration tests)
+// 内部单元测试省略：由集成测试覆盖
