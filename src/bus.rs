@@ -8,6 +8,7 @@ use std::{
     fmt,
     hash::Hash,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
 use parking_lot::RwLock;
@@ -37,7 +38,7 @@ impl<T> Subscription<T> {
     }
 }
 
-// 订阅索引：仅类型级；包含历史 sender（关闭后惰性清理）
+// 订阅索引：仅类型级；启动完成后不再增删（冻结）
 struct TypeIndex<T: Send + Sync + 'static> {
     any: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
 }
@@ -53,6 +54,7 @@ pub struct BusHandle {
 struct BusInner {
     subs: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     default_capacity: usize,
+    sealed: AtomicBool, // 一旦置 true，订阅结构视为只读
 }
 
 impl fmt::Debug for BusHandle {
@@ -71,6 +73,7 @@ impl Bus {
         let inner = BusInner {
             subs: RwLock::new(HashMap::new()),
             default_capacity,
+            sealed: AtomicBool::new(false),
         };
         Self {
             handle: BusHandle {
@@ -85,6 +88,9 @@ impl Bus {
 
 impl BusHandle {
     pub(crate) async fn subscribe_type<T: Send + Sync + 'static>(&self) -> Subscription<T> {
+        if self.inner.sealed.load(Ordering::Acquire) {
+            tracing::warn!("subscribe called after bus sealed (late task start); accepting for compatibility with startup race");
+        }
         let mut subs = self.inner.subs.write();
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
@@ -101,28 +107,22 @@ impl BusHandle {
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
         // 读取订阅快照（只读锁期间不执行 await）
-        let (open_count, idx_any, needs_cleanup): (usize, Option<SmallVec<[mpsc::Sender<Arc<T>>; 8]>>, bool) = {
+    let (open_count, idx_any): (usize, Option<SmallVec<[mpsc::Sender<Arc<T>>; 8]>>) = {
             let subs = self.inner.subs.read();
             if let Some(entry) = subs.get(&type_id) {
                 if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
                     // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
                     let mut opened: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-                    let mut closed = 0usize;
-                    for tx in idx.any.iter() { if tx.is_closed() { closed += 1; } else { opened.push(tx.clone()); } }
-                    let c = opened.len();
-                    (c, Some(opened), closed > 0)
+            for tx in idx.any.iter() { if !tx.is_closed() { opened.push(tx.clone()); } }
+            let c = opened.len();
+            (c, Some(opened))
                 } else {
                     tracing::error!("type mismatch in type index for this type");
-                    (0, None, false)
+            (0, None)
                 }
-            } else { (0, None, false) }
+        } else { (0, None) }
         };
-        if open_count == 0 { return; }
-        if needs_cleanup { // 惰性清理关闭 sender
-            if let Some(entry) = self.inner.subs.write().get_mut(&type_id) {
-                if let Some(idx) = entry.downcast_mut::<TypeIndex<T>>() { idx.any.retain(|tx| !tx.is_closed()); }
-            }
-        }
+    if open_count == 0 { return; }
         // 单订阅者快路径
         let Some(senders) = idx_any else { return; };
         if open_count == 1 {
@@ -161,6 +161,10 @@ impl BusHandle {
         }
         0
     }
+}
+
+impl BusHandle {
+    pub(crate) fn seal(&self) { self.inner.sealed.store(true, Ordering::Release); }
 }
 
 // 路由模型：类型级 fanout

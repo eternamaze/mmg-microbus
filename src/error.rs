@@ -25,6 +25,4 @@ impl StdError for MicrobusError {}
 
 pub type Result<T = ()> = std::result::Result<T, MicrobusError>;
 
-// 构造辅助函数（内部使用）
-#[inline]
-pub fn err_dynamic<S: Into<String>>(s: S) -> MicrobusError { MicrobusError::Dynamic(s.into()) }
+// 已无动态错误构造辅助需求，保留枚举即可（err_dynamic 移除）
