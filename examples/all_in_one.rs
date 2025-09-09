@@ -29,8 +29,8 @@ struct Feeder;
 
 #[mmg_microbus::component]
 impl Feeder {
-    // 展示主动函数：立即触发一次 + 每 100ms 触发一次，最多 5 次
-    #[mmg_microbus::active(immediate, interval_ms = 100, times = 5)]
+    // 展示主动函数：无限循环（框架协作式 yield，函数每完成一次立即再调度）
+    #[mmg_microbus::active]
     async fn tick(&self, _ctx: &mmg_microbus::component::ComponentContext) -> Tick {
         static CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -47,7 +47,7 @@ struct Trader { cfg: Option<TraderCfg> }
 impl Trader {
     // 初始化阶段读取配置并保存到组件状态
     #[mmg_microbus::init]
-    async fn setup(&mut self, cfg: &TraderCfg) -> anyhow::Result<()> { self.cfg = Some(cfg.clone()); Ok(()) }
+    async fn setup(&mut self, cfg: &TraderCfg) -> Result<()> { self.cfg = Some(cfg.clone()); Ok(()) }
     // 订阅 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态）
     #[mmg_microbus::handle]
     async fn on_tick(
@@ -68,7 +68,7 @@ impl Trader {
         &mut self,
         _ctx: &mmg_microbus::component::ComponentContext,
         price: &Price,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let symbol = self.cfg.as_ref().map(|c| c.symbol.as_str()).unwrap_or("");
         tracing::info!(target = "example.all", symbol = %symbol, price = price.0);
         Ok(())
@@ -80,7 +80,7 @@ impl Trader {
         &mut self,
         _ctx: &mmg_microbus::component::ComponentContext,
         _p: &Price,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         // 这里不做过滤，任意来源价格都会触发
         Ok(())
     }
@@ -105,7 +105,7 @@ impl Collector {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     // App 是唯一控制入口
     let mut app = App::new(Default::default());
     // 注册组件实例（类型安全）

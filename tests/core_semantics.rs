@@ -14,7 +14,7 @@ struct Stopped(&'static str);
 struct Producer;
 #[mmg_microbus::component]
 impl Producer {
-  #[mmg_microbus::active(immediate, interval_ms=10, times=5)]
+  #[mmg_microbus::active]
   async fn tick(&self, _ctx: &mmg_microbus::component::ComponentContext) -> Tick { static C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); Tick(C.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) }
 }
 
@@ -48,8 +48,8 @@ async fn end_to_end_flow_and_stop() {
   app.add_component::<Producer>("p");
   app.add_component::<Trader>("t");
   app.add_component::<Collector>("c");
-  let _ = app.config(Cfg{ n: 1 }).await.unwrap();
-  app.start().await.unwrap();
+  let _ = app.config(Cfg{ n: 1 }).await.expect("config");
+  app.start().await.expect("start");
   tokio::time::sleep(std::time::Duration::from_millis(80)).await;
   assert!(SEEN_PRICE.load(std::sync::atomic::Ordering::SeqCst) > 0);
   app.stop().await;

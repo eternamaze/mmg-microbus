@@ -1,12 +1,12 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::parse::{Parse, ParseStream};
+// removed unused Parse traits after simplifying active parsing
 use syn::Ident;
-use syn::{parse_macro_input, Attribute, Item, ItemImpl, ItemStruct, Token, Type};
+use syn::{parse_macro_input, Attribute, Item, ItemImpl, ItemStruct, Type};
 
 // 仅保留强类型“方法即订阅”路径。
 
-// removed: component_factory; single path is #[component] on struct + impl
+// 组件工厂通过 #[component] 结构体注解自动生成（单一构造路径）
 
 #[proc_macro_attribute]
 pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -34,7 +34,7 @@ fn component_for_struct(item: ItemStruct, _args: proc_macro2::TokenStream) -> To
         impl mmg_microbus::component::ComponentFactory for #factory_ident {
             fn kind_id(&self) -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#struct_ident>() }
             fn type_name(&self) -> &'static str { std::any::type_name::<#struct_ident>() }
-            async fn build(&self, id: mmg_microbus::bus::ComponentId, _bus: mmg_microbus::bus::BusHandle) -> anyhow::Result<Box<dyn mmg_microbus::component::Component>> { #build_body }
+            async fn build(&self, id: mmg_microbus::bus::ComponentId, _bus: mmg_microbus::bus::BusHandle) -> mmg_microbus::error::Result<Box<dyn mmg_microbus::component::Component>> { #build_body }
         }
         impl mmg_microbus::component::RegisteredComponent for #struct_ident {
             fn kind_id() -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#struct_ident>() }
@@ -50,16 +50,16 @@ fn component_for_impl(item: ItemImpl) -> TokenStream {
     generate_run_impl_inner(item, &self_ty)
 }
 
-// 移除旧的 #[configure] 宏：配置改为在 handle 签名中以 &CfgType 参数注入
+// 配置注入：在 #[init] 方法签名中以 &CfgType 参数体现
 
 // --- 方法即订阅（强类型，&T-only） + 生命周期钩子 ---
 // 用法（新）：
 //   #[mmg_microbus::component]
 //   impl MyComp {
 //       #[mmg_microbus::handle]
-//       async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, tick: &Tick) -> anyhow::Result<()> { Ok(()) }
+//       async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, tick: &Tick) -> mmg_microbus::error::Result<()> { Ok(()) }
 //   }
-// 说明：仅支持签名 (&ComponentContext, &T)，必须显式标注 #[handle]；#[handle] 仅用于实例过滤（instance/instances），不再支持 #[handle(T)] 旧语法。
+// 说明：仅支持签名 (&ComponentContext, &T)，必须显式标注 #[handle]
 
 #[proc_macro_attribute]
 pub fn handle(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -133,74 +133,24 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
 
     let mut methods: Vec<MethodSpec> = Vec::new();
     // Active methods
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ActiveKind { Loop, Once }
     #[derive(Clone)]
-    struct ActiveSpec {
-        ident: syn::Ident,
-        wants_ctx: bool,
-        ret_case: RetCase,
-        interval_ms: Option<u64>,
-        times: Option<u64>,
-        immediate: bool,
-    }
-    #[derive(Default)]
-    struct ActiveArgs {
-        interval_ms: Option<u64>,
-        times: Option<u64>,
-        immediate: bool,
-    }
-    impl Parse for ActiveArgs {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            let mut me = ActiveArgs::default();
-            while !input.is_empty() {
-                let key: Ident = input.parse()?;
-                // optional =value
-                if input.peek(Token![=]) {
-                    let _eq: Token![=] = input.parse()?;
-                    if key == "interval_ms" {
-                        let lit: syn::LitInt = input.parse()?;
-                        me.interval_ms = Some(lit.base10_parse::<u64>()?);
-                    } else if key == "times" {
-                        let lit: syn::LitInt = input.parse()?;
-                        me.times = Some(lit.base10_parse::<u64>()?);
-                    } else if key == "immediate" {
-                        let lit: syn::LitBool = input.parse()?;
-                        me.immediate = lit.value;
-                    } else if key == "once" {
-                        let lit: syn::LitBool = input.parse()?;
-                        me.times = Some(1);
-                        me.immediate = lit.value || me.immediate;
-                    } else {
-                        return Err(syn::Error::new(key.span(), "unknown key in #[active(...)]"));
-                    }
-                } else {
-                    // bare flags
-                    if key == "immediate" {
-                        me.immediate = true;
-                    } else if key == "once" {
-                        me.times = Some(1);
-                        me.immediate = true;
-                    } else {
-                        return Err(syn::Error::new(key.span(), "unknown key in #[active(...)]"));
-                    }
-                }
-                if input.peek(Token![,]) {
-                    let _c: Token![,] = input.parse()?;
-                }
+    struct ActiveSpec { ident: syn::Ident, wants_ctx: bool, ret_case: RetCase, kind: ActiveKind }
+    // 解析 #[active]：允许空（Loop）或 (once)
+    fn parse_active_kind(a: &Attribute) -> Option<syn::Result<ActiveKind>> {
+        let last = a.path().segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        if last.as_str() != "active" { return None; }
+        match &a.meta {
+            syn::Meta::Path(_) => Some(Ok(ActiveKind::Loop)),
+            syn::Meta::List(list) => {
+                // #[active(...)] 仅允许 once
+                if list.tokens.is_empty() { return Some(Ok(ActiveKind::Loop)); }
+                let content = list.tokens.to_string();
+                let trimmed = content.trim();
+                if trimmed == "once" { Some(Ok(ActiveKind::Once)) } else { Some(Err(syn::Error::new_spanned(&list.tokens, "#[active] only supports (once)"))) }
             }
-            Ok(me)
-        }
-    }
-    fn parse_active_args(a: &Attribute) -> Option<ActiveArgs> {
-        let last = a
-            .path()
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default();
-        if last.as_str() == "active" {
-            a.parse_args::<ActiveArgs>().ok()
-        } else {
-            None
+            syn::Meta::NameValue(nv) => Some(Err(syn::Error::new_spanned(nv, "#[active] does not take name-value arguments"))),
         }
     }
     let mut actives: Vec<ActiveSpec> = Vec::new();
@@ -259,12 +209,9 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
 
             // 处理 #[active]
             let mut is_active = false;
-            let mut args_parsed: Option<ActiveArgs> = None;
+            let mut active_kind: Option<ActiveKind> = None;
             for a in &m.attrs {
-                if let Some(parsed) = parse_active_args(a) {
-                    is_active = true;
-                    args_parsed = Some(parsed);
-                }
+                if let Some(res) = parse_active_kind(a) { is_active = true; match res { Ok(k) => active_kind = Some(k), Err(e) => { return e.to_compile_error().into(); } } }
             }
             if !is_active {
                 continue;
@@ -294,7 +241,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                     }
                 }
             }
-            let args_parsed = args_parsed.unwrap_or_default();
+            let kind = active_kind.unwrap_or(ActiveKind::Loop);
             if !extra_ref_params.is_empty() {
                 // 主动函数禁止除 ctx 以外的参数
                 let err = syn::Error::new_spanned(
@@ -303,14 +250,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 );
                 return err.to_compile_error().into();
             }
-            actives.push(ActiveSpec {
-                ident: m.sig.ident.clone(),
-                wants_ctx,
-                ret_case: analyze_return(&m.sig),
-                interval_ms: args_parsed.interval_ms,
-                times: args_parsed.times,
-                immediate: args_parsed.immediate,
-            });
+            actives.push(ActiveSpec { ident: m.sig.ident.clone(), wants_ctx, ret_case: analyze_return(&m.sig), kind });
         }
     }
 
@@ -377,7 +317,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                     if !extraneous.is_empty() {
                         let err = syn::Error::new_spanned(
                             &m.sig,
-                            "#[stop] method must take only self (no context or config parameters)",
+                            "#[stop] method must take only self or optionally &self plus &ComponentContext",
                         );
                         compile_errors.push(err.to_compile_error());
                     } else {
@@ -414,7 +354,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
             };
             quote! {{
                 let #var = mmg_microbus::component::__get_config::<#cty>(&ctx);
-                if let Some(#var) = #var { #ret } else { return Err(anyhow::anyhow!(concat!("missing config for init: ", stringify!(#cty)))); }
+                if let Some(#var) = #var { #ret } else { return Err(mmg_microbus::error::MicrobusError::MissingConfig(stringify!(#cty))); }
             }}
         } else {
             // 不应出现：#[init] 必须提供一个 &CfgType；若宏到此仍无类型，静默不生成调用。
@@ -446,9 +386,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     let mut sub_decls = Vec::new();
     let mut select_arms = Vec::new();
     // prepare active tickers and state
-    let mut active_decls = Vec::new();
     let mut active_arms = Vec::new();
-    let mut active_pre_immediate = Vec::new();
     for (idx, ms) in methods.iter().enumerate() {
         let ty = &ms.msg_ty;
         let method_ident = &ms.ident;
@@ -492,81 +430,45 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     }
     }
 
-    // Generate active loops
-    for (idx, a) in actives.iter().enumerate() {
+    // Active 调度： once 类直接在循环前调用； loop 类合并为单一 select 分支（yield 驱动公平）
+    let mut once_calls = Vec::new();
+    let mut loop_call_bodies = Vec::new();
+    for a in actives.iter() {
         let method_ident = &a.ident;
-        // call core
-        let call_core = if a.wants_ctx {
-            quote! { this.#method_ident(&ctx) }
-        } else {
-            quote! { this.#method_ident() }
-        };
+        let call_core = if a.wants_ctx { quote! { this.#method_ident(&ctx) } } else { quote! { this.#method_ident() } };
         let call_expr = match &a.ret_case {
             RetCase::Unit => quote! { let _ = #call_core.await; },
-            RetCase::ResultUnit => {
-                quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "active returned error"); } }
-            }
+            RetCase::ResultUnit => quote! { if let Err(e) = #call_core.await { tracing::warn!(error=?e, "active returned error"); } },
             RetCase::Some => quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } },
             RetCase::OptionSome => quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } },
-            RetCase::ResultSome => {
-                quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "active returned error") } }
-            }
-            RetCase::ResultOption => {
-                quote! { match #call_core.await { Ok(opt) => if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e) => tracing::warn!(error=?e, "active returned error") } }
-            }
+            RetCase::ResultSome => quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "active returned error") } },
+            RetCase::ResultOption => quote! { match #call_core.await { Ok(opt) => if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e) => tracing::warn!(error=?e, "active returned error") } },
         };
-        // declarations: counters and done flags
-        let cnt = format_ident!("__active_cnt_{}", idx);
-        let done = format_ident!("__active_done_{}", idx);
-        active_decls.push(quote! { let mut #cnt: u64 = 0; let mut #done: bool = false; });
-        // immediate exec (no `continue` here; guard on config presence)
-        if a.immediate || a.times == Some(1) {
-            let times_limit = if let Some(n) = a.times {
-                quote! { if #cnt >= #n { #done = true; } }
-            } else {
-                quote! {}
-            };
-            active_pre_immediate.push(
-                quote! { if !#done { { #call_expr } #cnt = #cnt.saturating_add(1); #times_limit } },
-            );
-        }
-        // interval 驱动：使用内部 sleep + 停止信号的选择，而不是上下文协作 API。
-        if let Some(ms) = a.interval_ms {
-            if ms > 0 {
-                let times_limit = if let Some(n) = a.times {
-                    quote! { if #cnt >= #n { #done = true; } }
-                } else { quote! {} };
-                let dur = proc_macro2::Literal::u64_unsuffixed(ms);
-                active_arms.push(quote! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(#dur)), if !#done => {
-                        { #call_expr }
-                        #cnt = #cnt.saturating_add(1);
-                        #times_limit
-                    }
-                });
-            }
-        }
+        if a.kind == ActiveKind::Once { once_calls.push(call_expr); } else { loop_call_bodies.push(call_expr); }
+    }
+    if !loop_call_bodies.is_empty() {
+        // 永远就绪的分支：若前面消息分支均未就绪，则立即执行全部 loop-active；实现“尽可能快”语义
+        active_arms.push(quote! { _ = async {} => { #( #loop_call_bodies )* } });
     }
 
     let gen_run = quote! {
         #[allow(unreachable_code)]
-        #[allow(deprecated)]
         #[async_trait::async_trait]
     impl mmg_microbus::component::Component for #self_ty {
-            async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> anyhow::Result<()> {
+            async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> mmg_microbus::error::Result<()> {
                 let mut this = *self;
         // 初始化阶段：调用 #[init] 标注的方法
         #( #init_calls )*
-        // 为每个处理方法建立强类型订阅
+    // 为每个处理方法建立强类型订阅
                 #(#sub_decls)*
-        // Active counters/tickers
-        #(#active_decls)*
-        // Immediate active invocations
-        #(#active_pre_immediate)*
-                // 组件类型 KindId
-                let __kind_id = mmg_microbus::bus::KindId::of::<#self_ty>();
+    // once-active 延迟到主循环首轮内执行（避免在其他组件尚未订阅前发布）
+    let mut __once_done = false;
+    // Active loop 分支：无调度间隔；无消息就绪时立即执行（最小延迟）
                 // 主循环：选择消息、主动任务与框架停机信号；收到停机信号即退出。
+                // 单次让出，保证其它组件已进入 run 并完成自身订阅
+                tokio::task::yield_now().await;
                 loop {
+                    if !__once_done { { #( #once_calls )* } __once_done = true; }
                     tokio::select! {
                         #(#select_arms)*
                         #(#active_arms)*
@@ -588,10 +490,11 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     expanded.into()
 }
 
-// 已移除 #[handles]：旧的 impl 标注入口不再存在，请使用 #[component] 标注 struct 与 impl。
+// 统一入口：使用 #[component] 标注 struct 与 impl
 
 /// Mark a method as proactive/active loop. Example:
-///   #[active(interval_ms=1000)] async fn tick(&self, &Context, &Cfg) -> anyhow::Result<()>
+///   #[active] async fn tick(&self) -> mmg_microbus::error::Result<()> // loop
+///   #[active(once)] async fn init_once(&self) -> Option<Message>      // one-shot
 #[proc_macro_attribute]
 pub fn active(_args: TokenStream, input: TokenStream) -> TokenStream {
     input

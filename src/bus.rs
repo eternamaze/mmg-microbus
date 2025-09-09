@@ -26,7 +26,7 @@ impl fmt::Debug for KindId {
     }
 }
 
-// 地址模型已移除：仅按消息类型进行路由
+// 类型级 fanout 路由（按消息类型广播，不做拓扑/主题分层）
 
 pub struct Subscription<T> {
     rx: mpsc::Receiver<Arc<T>>,
@@ -37,7 +37,7 @@ impl<T> Subscription<T> {
     }
 }
 
-// 订阅索引：仅类型级（any-of-type）
+// 订阅索引：仅类型级；包含历史 sender（关闭后惰性清理）
 struct TypeIndex<T: Send + Sync + 'static> {
     any: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
 }
@@ -61,7 +61,7 @@ impl fmt::Debug for BusHandle {
     }
 }
 
-// 路由索引：仅类型级（any-of-type），不支持实例级寻址
+// 路由索引：类型级（any-of-type）
 
 pub struct Bus {
     handle: BusHandle,
@@ -92,80 +92,63 @@ impl BusHandle {
             .entry(type_id)
             .or_insert_with(|| Box::new(TypeIndex::<T>::default()) as Box<dyn Any + Send + Sync>);
         let (tx, rx) = mpsc::channel::<Arc<T>>(cap);
-        let idx = entry.downcast_mut::<TypeIndex<T>>().expect("type index");
-        idx.any.push(tx);
+        if let Some(idx) = entry.downcast_mut::<TypeIndex<T>>() { idx.any.push(tx); } else { tracing::error!("type index downcast failed; subscription ignored"); }
         Subscription { rx }
     }
     // 内部发送实现（统一入口）
     pub(crate) async fn publish_type<T: Send + Sync + 'static>(&self, msg: T) {
+        // 顺序语义：同一类型的消息进入每个订阅者通道的顺序=各 publish 调用实际完成入队的顺序；无全局跨组件开播时间排序保证。
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
-        let senders: Vec<mpsc::Sender<Arc<T>>> = {
+        // 读取订阅快照（只读锁期间不执行 await）
+        let (open_count, idx_any, needs_cleanup): (usize, Option<SmallVec<[mpsc::Sender<Arc<T>>; 8]>>, bool) = {
             let subs = self.inner.subs.read();
             if let Some(entry) = subs.get(&type_id) {
                 if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
-                    let mut v: Vec<mpsc::Sender<Arc<T>>> = Vec::new();
-                    v.extend(idx.any.iter().cloned());
-                    v
+                    // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
+                    let mut opened: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
+                    let mut closed = 0usize;
+                    for tx in idx.any.iter() { if tx.is_closed() { closed += 1; } else { opened.push(tx.clone()); } }
+                    let c = opened.len();
+                    (c, Some(opened), closed > 0)
                 } else {
                     tracing::error!("type mismatch in type index for this type");
-                    Vec::new()
+                    (0, None, false)
                 }
-            } else {
-                Vec::new()
-            }
+            } else { (0, None, false) }
         };
-    let total = senders.iter().filter(|tx| !tx.is_closed()).count();
-        if total == 0 {
-            return;
-        }
-    // 单订阅者快路径：避免不必要的分配
-        if total == 1 {
-            // 找到唯一仍打开的接收者
-            for tx in &senders {
-                if !tx.is_closed() {
-                    match tx.try_send(arc.clone()) {
-                        Ok(()) => return,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            let _ = tx.send(arc).await;
-                            return;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
-                    }
-                }
-            }
-            return;
-        }
-    // 多订阅者：收集仍然开启的接收者（转移所有权以便 try_send）
-    let mut recipients: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-    // 依据 total 预留容量，减少重分配
-    recipients.reserve(total);
-        for tx in &senders {
-            if !tx.is_closed() {
-                recipients.push(tx.clone());
+        if open_count == 0 { return; }
+        if needs_cleanup { // 惰性清理关闭 sender
+            if let Some(entry) = self.inner.subs.write().get_mut(&type_id) {
+                if let Some(idx) = entry.downcast_mut::<TypeIndex<T>>() { idx.any.retain(|tx| !tx.is_closed()); }
             }
         }
-        if recipients.is_empty() { return; }
-    // try_send 快路径：优先非阻塞发送，剩余的再 await
+        // 单订阅者快路径
+        let Some(senders) = idx_any else { return; };
+        if open_count == 1 {
+            let tx = &senders[0];
+            match tx.try_send(arc.clone()) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { let _ = tx.send(arc).await; return; }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+        // 多订阅者：先 try_send，满的收集到 pending 再顺序 await（最后一次复用 arc）
         let mut pending: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-        for tx in recipients.into_iter() {
+        for tx in senders.iter() {
             match tx.try_send(arc.clone()) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    pending.push(tx);
-                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending.push(tx.clone()),
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
         if !pending.is_empty() {
             let last = pending.len() - 1;
-            for i in 0..last {
-                let _ = pending[i].send(arc.clone()).await;
-            }
+            for i in 0..last { let _ = pending[i].send(arc.clone()).await; }
             let _ = pending[last].send(arc).await;
         }
     }
-    // 发布接口不对外暴露；仅供宏生成代码内部使用
+    // 发布接口：仅供宏生成代码内部使用
 
     #[cfg(test)]
     pub async fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
@@ -180,10 +163,10 @@ impl BusHandle {
     }
 }
 
-// 地址模型：已移除；仅类型级路由
+// 路由模型：类型级 fanout
 
 // 背压策略：有界 mpsc + try_send 优先，必要时 await；单订阅者快路径；SmallVec 降低分配成本。
 
-// 指标采集已移除：保持总线实现最小化
+// 实现保持最小化（无内部指标采集）
 
 // 内部单元测试省略：由集成测试覆盖

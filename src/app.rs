@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{Result, MicrobusError};
 use std::any::TypeId;
 use tokio::task::JoinHandle;
 
@@ -61,7 +61,7 @@ impl App {
 
     /// 配置入口（单项）：
     /// - 传入任意业务配置类型，按类型存入只读配置仓库，供 #[init] 形参按 &T 自动注入。
-    /// - 不再识别或消费框架配置类型（例如 AppConfig）；框架配置仅在 `App::new(AppConfig)` 提供。
+    /// - 框架配置仅通过 `App::new(AppConfig)` 提供；业务配置通过 `config()` 注入。
     /// - 可多次调用以注入多种类型。
     /// - 仅在启动前允许；启动后不支持动态更新。
     pub async fn config<T: 'static + Send + Sync>(&mut self, cfg: T) -> Result<&mut Self> {
@@ -107,9 +107,7 @@ impl App {
         }
         // 统一入口：必须显式装配组件。若未配置，立即报错，避免出现多种装配体验。
         if self.cfg.components.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no components configured: call App::add_component::<T>(id) before start()"
-            ));
+            return Err(MicrobusError::NoComponents);
         }
         // 冻结配置存储
         let cfg_store = if let Some(f) = self.frozen_cfg.clone() {
@@ -121,18 +119,14 @@ impl App {
         };
         // 工厂表来自 add_component 阶段登记的 KindId -> Factory
 
-    // 不再进行路由约束检查：handle 仅按消息类型与可选实例字符串过滤，无需检验组件种类单例性。
+    // 路由：仅按消息类型 fanout，无额外拓扑或单例检查
 
         let handle = self.bus.handle();
         for cc in self.cfg.components.iter() {
             // 查表匹配配置的 kind（KindId）
             let factory = match self.factories.get(&cc.kind) {
                 Some(f) => f.clone(),
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "unknown component kind: ensure component type with #[component] is linked and added"
-                    ));
-                }
+                None => { return Err(MicrobusError::UnknownComponentKind); }
             };
             let id = cc.id.clone();
             let bus_handle = handle.clone();

@@ -1,6 +1,4 @@
-//! Compile-fail UI tests for #[handle]
-
-// removed: previous compile-fail cases for instance filtering are obsolete after syntax change
+//! UI tests入口（当前仅最小 happy 场景）
 
 #[test]
 fn ui_handle_happy_min_ok() {

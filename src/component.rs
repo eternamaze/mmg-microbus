@@ -1,5 +1,6 @@
 use crate::bus::{BusHandle, ComponentId, KindId};
 use async_trait::async_trait;
+use crate::error::Result;
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -12,7 +13,7 @@ use tokio::sync::watch;
 
 #[async_trait]
 pub trait Component: Send + Sync + 'static + Any {
-    async fn run(self: Box<Self>, ctx: ComponentContext) -> anyhow::Result<()>;
+    async fn run(self: Box<Self>, ctx: ComponentContext) -> Result<()>;
 }
 
 impl dyn Component {
@@ -30,7 +31,7 @@ pub trait ComponentFactory: Send + Sync {
     fn kind_id(&self) -> KindId;
     fn type_name(&self) -> &'static str;
     /// 基础构建器（无业务配置）
-    async fn build(&self, id: ComponentId, bus: BusHandle) -> anyhow::Result<Box<dyn Component>>;
+    async fn build(&self, id: ComponentId, bus: BusHandle) -> crate::error::Result<Box<dyn Component>>;
 }
 
 impl fmt::Debug for dyn ComponentFactory {
@@ -106,7 +107,7 @@ impl ComponentContext {
 
     // 仅保留单一构造路径，避免歧义；组件以 kind 进行类型化
 
-    // 对外发布 API 已移除：业务通过返回值进行发布（由宏注入内部助手完成）
+    // 发布采用“返回值即发布”模型（由宏注入的内部助手完成）
     // 仅支持强类型通道（&T），不提供 Any 装配
 
     // 配置不支持热更新：仅在启动时注入一次
@@ -137,30 +138,22 @@ impl<T> AutoSubscription<T> {
 // 内部宏辅助 API（不对业务暴露）
 // 订阅：仅类型级（任意来源）
 
-    #[doc(hidden)]
-    #[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
     pub async fn __subscribe_any_auto<T: Send + Sync + 'static>(ctx: &ComponentContext) -> AutoSubscription<T> {
         let sub = ctx.bus.subscribe_type::<T>().await;
         AutoSubscription { inner: sub }
     }
 
 // 发布：仅由宏在返回值场景调用；不对业务暴露
-#[doc(hidden)]
-#[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
 pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, msg: T) {
     ctx.bus.publish_type(msg).await;
 }
 
 /// 内部配置读取：仅供宏使用，防止业务侧滥用
-#[doc(hidden)]
-#[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
 pub fn __get_config<T: 'static + Send + Sync>(ctx: &ComponentContext) -> Option<Arc<T>> {
     ctx.cfg.get::<T>()
 }
 
 /// 内部停止信号（仅供宏生成的 run() 使用）
-#[doc(hidden)]
-#[deprecated(note = "internal-only helper: used by macros; do not call from application code")] 
 pub async fn __recv_stop(ctx: &ComponentContext) {
     let mut rx = ctx.stop.clone();
     let _ = rx.changed().await;

@@ -4,7 +4,7 @@
 
 ## 设计目标与核心理念
 - 写业务即配置：出现 `&T` 即订阅类型 T；返回值即发布。
-- 极简强约束：去除寻址/实例过滤/外部发布与订阅；仅保留“按类型路由”。
+- 极简强约束：仅按类型路由（无寻址、实例过滤、外部发布或订阅接口）。
 - 业务解耦：业务类型移除注解即可独立编译（未使用 Context 时）。
 - 只读上下文：不提供停机协作与副作用能力。
 
@@ -24,7 +24,7 @@
 - `app.start().await?`：执行下列步骤：
   - 初始化：为每个组件调用 `#[init]`（若存在）。若该组件声明了 `&Cfg` 但未注入，启动失败返回错误。
   - 订阅装配：扫描组件方法签名，凡 `#[handle]` 且含单个 `&T`，即向总线注册对 T 的订阅。
-  - 主动任务调度：为每个 `#[active]` 方法创建调度器（支持 `interval_ms`/`times`/`immediate`/`once`）。
+  - 主动任务调度：为每个 `#[active]` 方法确定模式：`#[active]` 无限循环（协作式 yield），`#[active(once)]` 执行一次。
 
 3) 运行期
 - 被动消费：总线按“消息类型”将消息 fanout 给所有订阅者；对应 `#[handle]` 以消息 `&T` 为入参被调用。
@@ -49,12 +49,15 @@
 
 - `#[active]`（主动）：
   - 形参：仅可选 `&ComponentContext`；不允许业务 `&T` 参数。
-  - 调度参数：`interval_ms = N`，`times = N`，`immediate`，`once`（等效 `times=1, immediate=true`）。
+  - 形式：
+    - `#[active]` 无限循环：函数每次完成后立即再次调度（不做框架层退让；只有函数内部的 `await` 才会让出）。
+    - `#[active(once)]` 单次执行：启动后执行一次，不再进入循环。
+  - 不支持其它参数（出现即编译错误）。
   - 返回：见“返回值即发布”。
 
 - `#[init]`（初始化）：
   - 形参：可选 `&ComponentContext` + 恰好一个 `&Cfg`（业务配置类型）。
-  - 行为：App 启动前从配置仓库取出 `Cfg` 调用该方法；缺失则启动失败。
+  - 行为：App 启动前从配置仓库取出 `Cfg` 调用该方法；缺失则启动失败（返回 `MicrobusError::MissingConfig`).
   - 建议：将 `Cfg` 克隆/拷贝到组件状态以供后续使用。
   - 返回：见“返回值即发布”。
 
@@ -68,20 +71,20 @@
 - 唯一路由键：消息类型 `T`。
 - 订阅登记：编译期通过宏生成注册代码；运行期在 `start()` 时完成。
 - 投递策略：对每个 T，fanout 到所有订阅者；每个订阅者独立处理其收到的消息实例。
-- 不提供：Address/ServiceAddr/实例过滤/外部发布与订阅 API。
+- 路由接口仅限类型 fanout（无地址、实例过滤、外部发布或订阅接口）。
 
 ## ComponentContext（只读能力）
-- 不提供任何停机协作 API（无 graceful_sleep、无 ticker）。
-- 不提供 `spawn` / 外部发布/订阅 等会产生副作用的能力。
+- 不包含协作停机 API。
+- 不包含 `spawn` 或外部发布/订阅接口。
 
 ## 配置注入模型
-- 框架配置（AppConfig）：仅在 `App::new(AppConfig)` 提供；不再通过 `app.config(..)` 识别框架配置类型。
+- 框架配置（AppConfig）：仅在 `App::new(AppConfig)` 提供；业务配置通过 `app.config(..)` 注入。
 - 业务配置：`app.config(Cfg { .. }).await?`；同类型多次写入后写覆盖（建议在日志层给出覆盖提示）。
 - 读取：仅框架在调用 `#[init]` 时按声明类型读取；业务运行期不可随意读取。
-- 失败：若组件声明了 `#[init](&Cfg)` 但实际缺失该类型配置，`start()` 返回错误。
+- 失败：若组件声明了 `#[init](&Cfg)` 但缺少该配置，`start()` 返回错误。
 
 ## 停机（非协作）
-- 框架单方面控制停机：调用 `stop()` 即结束；如提供 `#[stop]` 则同步调用一次后立刻丢弃组件。
+- 停止：调用 `stop()` 结束；若存在 `#[stop]` 则调用后结束。
 
 ## 使用示例（最小闭环）
 ```rust
@@ -101,9 +104,15 @@ impl AppComp {
     self.cfg = Some(cfg.clone());
   }
 
-  #[mmg_microbus::active(immediate, interval_ms=100, times=3)]
+  #[mmg_microbus::active] // 无限循环
   async fn tick(&mut self, _ctx: &mmg_microbus::component::ComponentContext) -> Option<Tick> {
     Some(Tick(self.cfg.as_ref().map(|c| c.n).unwrap_or(0)))
+  }
+
+  #[mmg_microbus::active(once)]
+  async fn bootstrap(&self) -> Option<Tick> {
+    // 单次执行：发布一次初始 Tick，然后不再调度
+    Some(Tick(0))
   }
 
   #[mmg_microbus::handle]
@@ -113,7 +122,7 @@ impl AppComp {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> mmg_microbus::error::Result<()> {
   let mut app = App::new(Default::default());
   app.add_component::<AppComp>("app");
   app.config(Cfg { n: 42 }).await?;
@@ -129,9 +138,9 @@ async fn main() -> anyhow::Result<()> {
 - 收不到消息：确认组件已添加并完成 `start()`；确保消息类型匹配并存在生产方（主动函数返回或其他 handler 返回）。
 
 ## 边界与非目标
-- 仅进程内；不含网络/IPC。
-- 不提供幂等器/重试；慢消费者会形成自身背压。
-- 不提供字符串主题/动态类型擦除的路由。
+- 仅进程内（不含网络/IPC）。
+- 不含幂等或重试；慢消费者产生背压。
+- 不含字符串主题或动态类型擦除路由。
 
 ## 文档约定
 - 本文（FULL_GUIDE）为机制与出入口的权威总览；一切以本文为准。
