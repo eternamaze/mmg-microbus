@@ -645,6 +645,8 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 // 主循环：选择消息、主动任务与框架停机信号；收到停机信号即退出。
                 // 单次让出，保证其它组件已进入 run 并完成自身订阅
                 tokio::task::yield_now().await;
+                // 额外让出，确保所有组件有足够时间完成订阅设置
+                tokio::task::yield_now().await;
                 loop {
                     if !__once_done { { #( #once_calls )* } __once_done = true; }
                     tokio::select! {
