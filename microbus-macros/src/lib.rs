@@ -85,7 +85,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     struct HandleAttr { has_args: bool }
     fn parse_handle_attr(a: &Attribute) -> HandleAttr {
         // 若存在任何 token，标记为非法
-        let has = !a.meta.require_path_only().is_ok();
+        let has = a.meta.require_path_only().is_err();
         HandleAttr { has_args: has }
     }
     fn get_param_ident(p: &syn::Pat) -> Option<Ident> { if let syn::Pat::Ident(pi) = p { Some(pi.ident.clone()) } else { None } }

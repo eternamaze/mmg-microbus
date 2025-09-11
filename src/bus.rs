@@ -107,12 +107,13 @@ impl BusHandle {
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
         // 读取订阅快照（只读锁期间不执行 await）
-    let (open_count, idx_any): (usize, Option<SmallVec<[mpsc::Sender<Arc<T>>; 8]>>) = {
+        type SenderVec<T> = SmallVec<[mpsc::Sender<Arc<T>>; 8]>;
+        let (open_count, idx_any): (usize, Option<SenderVec<T>>) = {
             let subs = self.inner.subs.read();
             if let Some(entry) = subs.get(&type_id) {
                 if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
                     // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
-                    let mut opened: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
+                    let mut opened: SenderVec<T> = SmallVec::new();
             for tx in idx.any.iter() { if !tx.is_closed() { opened.push(tx.clone()); } }
             let c = opened.len();
             (c, Some(opened))
