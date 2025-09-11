@@ -2,17 +2,16 @@
 pub struct ComponentId(pub String);
 use smallvec::SmallVec;
 
+use parking_lot::RwLock;
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt,
     hash::Hash,
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
 };
 use tokio::sync::mpsc;
-use parking_lot::RwLock;
-
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct KindId(TypeId);
@@ -43,7 +42,11 @@ struct TypeIndex<T: Send + Sync + 'static> {
     any: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
 }
 impl<T: Send + Sync + 'static> Default for TypeIndex<T> {
-    fn default() -> Self { Self { any: SmallVec::new() } }
+    fn default() -> Self {
+        Self {
+            any: SmallVec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -98,7 +101,11 @@ impl BusHandle {
             .entry(type_id)
             .or_insert_with(|| Box::new(TypeIndex::<T>::default()) as Box<dyn Any + Send + Sync>);
         let (tx, rx) = mpsc::channel::<Arc<T>>(cap);
-        if let Some(idx) = entry.downcast_mut::<TypeIndex<T>>() { idx.any.push(tx); } else { tracing::error!("type index downcast failed; subscription ignored"); }
+        if let Some(idx) = entry.downcast_mut::<TypeIndex<T>>() {
+            idx.any.push(tx);
+        } else {
+            tracing::error!("type index downcast failed; subscription ignored");
+        }
         Subscription { rx }
     }
     // 内部发送实现（统一入口）
@@ -114,23 +121,36 @@ impl BusHandle {
                 if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
                     // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
                     let mut opened: SenderVec<T> = SmallVec::new();
-            for tx in idx.any.iter() { if !tx.is_closed() { opened.push(tx.clone()); } }
-            let c = opened.len();
-            (c, Some(opened))
+                    for tx in idx.any.iter() {
+                        if !tx.is_closed() {
+                            opened.push(tx.clone());
+                        }
+                    }
+                    let c = opened.len();
+                    (c, Some(opened))
                 } else {
                     tracing::error!("type mismatch in type index for this type");
-            (0, None)
+                    (0, None)
                 }
-        } else { (0, None) }
+            } else {
+                (0, None)
+            }
         };
-    if open_count == 0 { return; }
+        if open_count == 0 {
+            return;
+        }
         // 单订阅者快路径
-        let Some(senders) = idx_any else { return; };
+        let Some(senders) = idx_any else {
+            return;
+        };
         if open_count == 1 {
             let tx = &senders[0];
             match tx.try_send(arc.clone()) {
                 Ok(()) => return,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { let _ = tx.send(arc).await; return; }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    let _ = tx.send(arc).await;
+                    return;
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
             }
         }
@@ -145,7 +165,9 @@ impl BusHandle {
         }
         if !pending.is_empty() {
             let last = pending.len() - 1;
-            for i in 0..last { let _ = pending[i].send(arc.clone()).await; }
+            for i in 0..last {
+                let _ = pending[i].send(arc.clone()).await;
+            }
             let _ = pending[last].send(arc).await;
         }
     }
@@ -165,7 +187,9 @@ impl BusHandle {
 }
 
 impl BusHandle {
-    pub(crate) fn seal(&self) { self.inner.sealed.store(true, Ordering::Release); }
+    pub(crate) fn seal(&self) {
+        self.inner.sealed.store(true, Ordering::Release);
+    }
 }
 
 // 路由模型：类型级 fanout

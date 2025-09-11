@@ -11,7 +11,7 @@ pub mod prelude {
     pub use crate::app::App;
     // 参数注入：仅通过函数参数访问上下文、消息与配置
     pub use crate::component::ComponentContext;
-    pub use crate::error::{Result, MicrobusError};
+    pub use crate::error::{MicrobusError, Result};
 }
 
 pub use microbus_macros::*;

@@ -41,25 +41,32 @@ impl Feeder {
 // ---- 被动订阅组件：演示上下文与配置注入 ----
 #[mmg_microbus::component]
 #[derive(Default)]
-struct Trader { cfg: Option<TraderCfg> }
+struct Trader {
+    cfg: Option<TraderCfg>,
+}
 
 #[mmg_microbus::component]
 impl Trader {
     // 初始化阶段读取配置并保存到组件状态
     #[mmg_microbus::init]
-    async fn setup(&mut self, cfg: &TraderCfg) -> Result<()> { self.cfg = Some(cfg.clone()); Ok(()) }
+    async fn setup(&mut self, cfg: &TraderCfg) -> Result<()> {
+        self.cfg = Some(cfg.clone());
+        Ok(())
+    }
     // 订阅 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态）
     #[mmg_microbus::handle]
     async fn on_tick(
         &mut self,
-    _ctx: &mmg_microbus::component::ComponentContext,
+        _ctx: &mmg_microbus::component::ComponentContext,
         tick: &Tick,
     ) -> Option<Price> {
         let min_tick = self.cfg.as_ref().map(|c| c.min_tick).unwrap_or(0);
         if min_tick == 0 || tick.0 % min_tick == 0 {
             // 将 Tick 转换成 Price；返回值即发布
             Some(Price(tick.0 as f64))
-        } else { None }
+        } else {
+            None
+        }
     }
 
     // 简化：不区分来源；消息类型即订阅
@@ -87,7 +94,9 @@ impl Trader {
 
     // 停止钩子：框架停机时同步调用一次，返回值将自动发布
     #[mmg_microbus::stop]
-    async fn on_stop(&self) -> Stopped { Stopped("bye") }
+    async fn on_stop(&self) -> Stopped {
+        Stopped("bye")
+    }
 }
 
 // ---- 实例使用字符串 ID（不再需要强类型实例标记/服务类型） ----

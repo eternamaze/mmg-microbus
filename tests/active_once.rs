@@ -42,6 +42,14 @@ async fn active_once_executes_exactly_once() {
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     app.stop().await;
-    assert_eq!(ACTIVE_CALLS.load(Ordering::SeqCst), 1, "active(once) should run exactly once");
-    assert_eq!(RECEIVED.load(Ordering::SeqCst), 1, "message from active(once) should be published exactly once");
+    assert_eq!(
+        ACTIVE_CALLS.load(Ordering::SeqCst),
+        1,
+        "active(once) should run exactly once"
+    );
+    assert_eq!(
+        RECEIVED.load(Ordering::SeqCst),
+        1,
+        "message from active(once) should be published exactly once"
+    );
 }

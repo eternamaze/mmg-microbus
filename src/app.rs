@@ -1,4 +1,4 @@
-use crate::error::{Result, MicrobusError};
+use crate::error::{MicrobusError, Result};
 use std::any::TypeId;
 use tokio::task::JoinHandle;
 
@@ -29,7 +29,7 @@ pub struct App {
 impl App {
     pub fn new(cfg: AppConfig) -> Self {
         let bus = Bus::new(cfg.queue_capacity);
-    let (tx, _rx) = tokio::sync::watch::channel(false);
+        let (tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             cfg,
             bus,
@@ -119,14 +119,16 @@ impl App {
         };
         // 工厂表来自 add_component 阶段登记的 KindId -> Factory
 
-    // 路由：仅按消息类型 fanout，无额外拓扑或单例检查
+        // 路由：仅按消息类型 fanout，无额外拓扑或单例检查
 
         let handle = self.bus.handle();
-    for cc in self.cfg.components.iter() {
+        for cc in self.cfg.components.iter() {
             // 查表匹配配置的 kind（KindId）
             let factory = match self.factories.get(&cc.kind) {
                 Some(f) => f.clone(),
-                None => { return Err(MicrobusError::UnknownComponentKind); }
+                None => {
+                    return Err(MicrobusError::UnknownComponentKind);
+                }
             };
             let id = cc.id.clone();
             let bus_handle = handle.clone();
@@ -159,12 +161,12 @@ impl App {
             let h = tokio::spawn(fut);
             self.tasks.push(h);
         }
-    // 让出多次调度，尽力确保所有组件进入 run() 并完成各自订阅
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-    // 冻结 bus：后续不再期望新增订阅
-    handle.seal();
-    self.started = true;
+        // 让出多次调度，尽力确保所有组件进入 run() 并完成各自订阅
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        // 冻结 bus：后续不再期望新增订阅
+        handle.seal();
+        self.started = true;
         Ok(())
     }
     pub async fn stop(&mut self) {

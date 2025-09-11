@@ -1,6 +1,6 @@
 use crate::bus::{BusHandle, ComponentId, KindId};
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -31,7 +31,11 @@ pub trait ComponentFactory: Send + Sync {
     fn kind_id(&self) -> KindId;
     fn type_name(&self) -> &'static str;
     /// 基础构建器（无业务配置）
-    async fn build(&self, id: ComponentId, bus: BusHandle) -> crate::error::Result<Box<dyn Component>>;
+    async fn build(
+        &self,
+        id: ComponentId,
+        bus: BusHandle,
+    ) -> crate::error::Result<Box<dyn Component>>;
 }
 
 impl fmt::Debug for dyn ComponentFactory {
@@ -89,7 +93,9 @@ pub struct ComponentContext {
 
 impl ComponentContext {
     // 组件标识符仅供运行期内部使用；不对业务暴露寻址能力
-    pub fn id(&self) -> &crate::bus::ComponentId { &self.id }
+    pub fn id(&self) -> &crate::bus::ComponentId {
+        &self.id
+    }
     pub fn new_with_service(
         id: ComponentId,
         _service: KindId,
@@ -97,12 +103,7 @@ impl ComponentContext {
         stop: watch::Receiver<bool>,
         cfg: ConfigStore,
     ) -> Self {
-        Self {
-            id,
-            bus,
-            stop,
-            cfg,
-        }
+        Self { id, bus, stop, cfg }
     }
 
     // 仅保留单一构造路径，避免歧义；组件以 kind 进行类型化
@@ -130,7 +131,9 @@ pub struct AutoSubscription<T> {
     inner: crate::bus::Subscription<T>,
 }
 impl<T> AutoSubscription<T> {
-    pub async fn recv(&mut self) -> Option<std::sync::Arc<T>> { self.inner.recv().await }
+    pub async fn recv(&mut self) -> Option<std::sync::Arc<T>> {
+        self.inner.recv().await
+    }
 }
 
 // 设计约束：Context 为只读，不提供副作用或协作停机 API（详见文档）
@@ -138,10 +141,12 @@ impl<T> AutoSubscription<T> {
 // 内部宏辅助 API（不对业务暴露）
 // 订阅：仅类型级（任意来源）
 
-    pub async fn __subscribe_any_auto<T: Send + Sync + 'static>(ctx: &ComponentContext) -> AutoSubscription<T> {
-        let sub = ctx.bus.subscribe_type::<T>().await;
-        AutoSubscription { inner: sub }
-    }
+pub async fn __subscribe_any_auto<T: Send + Sync + 'static>(
+    ctx: &ComponentContext,
+) -> AutoSubscription<T> {
+    let sub = ctx.bus.subscribe_type::<T>().await;
+    AutoSubscription { inner: sub }
+}
 
 // 发布：仅由宏在返回值场景调用；不对业务暴露
 pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, msg: T) {
