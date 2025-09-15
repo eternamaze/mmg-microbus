@@ -10,7 +10,6 @@ use std::{
 };
 use tokio::sync::Notify;
 
-
 #[async_trait]
 pub trait Component: Send + Sync + 'static + Any {
     async fn run(self: Box<Self>, ctx: ComponentContext) -> Result<()>;
