@@ -17,7 +17,7 @@
 ## 生命周期全流程
 1) 组装
 - 构造 App：`let mut app = App::new(Default::default());`
-- 注册组件：`app.add_component::<MyComp>("id");`（id 为运行期唯一字符串；业务结构体不含 id 字段）。
+- （已收敛单例）组件无需显式注册：凡使用 `#[component]` 标注的结构体会在编译期登记并于 `start()` 自动实例化一次。
 - 注入配置（可选、可多种类型）：`app.config(MyCfg { .. }).await?`（同类型后写覆盖，最后值生效）。
 
 2) 启动
@@ -29,14 +29,14 @@
 3) 运行期
 - 被动消费：总线按“消息类型”将消息 fanout 给所有订阅者；对应 `#[handle]` 以消息 `&T` 为入参被调用。
 - 主动生产：`#[active]` 周期（或一次）执行；其返回值按规则自动发布到总线。
-- 返回值即发布：任意被注解的方法返回值会发布：
-  - `T` -> 发布 `T`
-  - `Option<T>` -> `Some(T)` 才发布
-  - `Result<T, E>` -> `Ok(T)` 才发布
-  - `Result<Option<T>, E>` -> `Ok(Some(T))` 才发布
+- 返回值即发布（支持六类最小自然集合）：
+  - `()` / `Result<()>` ：不发布；错误以 warn 记录。
+  - `T` / `Result<T, E>` ：成功发布一条 `T`。
+  - `Option<T>` / `Result<Option<T>, E>` ：`Some(T)` 成功才发布；`None` 静默。
+  - 其它包装暂不支持（保持语义最小闭包）；需要扩展将通过新增注解或显式类型引入，而非隐式推断。
 
 4) 停止
-- `app.stop().await`：框架直接下达停止指令；若组件提供 `#[stop]` 则同步调用一次，返回即视为结束，随后总线丢弃该组件；未提供则直接丢弃。
+- `app.stop().await`：设置内部原子停止标志并通知全部组件；组件下一轮 `select` 退出主循环；若提供 `#[stop]` 则调用一次后结束。
 
 ## 宏与方法签名契约（出入口）
 - `#[component]`（struct 与 impl 上）：
@@ -74,8 +74,9 @@
 - 路由接口仅限类型 fanout（无地址、实例过滤、外部发布或订阅接口）。
 
 ## ComponentContext（只读能力）
-- 不包含协作停机 API。
-- 不包含 `spawn` 或外部发布/订阅接口。
+- 无协作停机 / 取消接口：只在内部 stop 通知到达后退出。
+- 无任意发布 / 动态订阅接口：路由绑定全部在启动阶段静态生成。
+- 无反射逃逸：不提供 `as_any` 之类方法。
 
 ## 配置注入模型
 - 框架配置（AppConfig）：仅在 `App::new(AppConfig)` 提供；业务配置通过 `app.config(..)` 注入。
@@ -124,7 +125,7 @@ impl AppComp {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> mmg_microbus::error::Result<()> {
   let mut app = App::new(Default::default());
-  app.add_component::<AppComp>("app");
+  // 不再需要 add_component；组件单例自动发现
   app.config(Cfg { n: 42 }).await?;
   app.start().await?;
   app.stop().await;

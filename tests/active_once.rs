@@ -37,8 +37,6 @@ impl Collector {
 #[tokio::test(flavor = "multi_thread")]
 async fn active_once_executes_exactly_once() {
     let mut app = App::new(Default::default());
-    app.add_component::<Booter>("booter");
-    app.add_component::<Collector>("collector");
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     app.stop().await;

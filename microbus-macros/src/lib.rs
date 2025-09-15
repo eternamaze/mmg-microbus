@@ -32,15 +32,14 @@ fn component_for_struct(item: ItemStruct, _args: proc_macro2::TokenStream) -> To
         struct #factory_ident;
         #[async_trait::async_trait]
         impl mmg_microbus::component::ComponentFactory for #factory_ident {
-            fn kind_id(&self) -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#struct_ident>() }
             fn type_name(&self) -> &'static str { std::any::type_name::<#struct_ident>() }
-            async fn build(&self, id: mmg_microbus::bus::ComponentId, _bus: mmg_microbus::bus::BusHandle) -> mmg_microbus::error::Result<Box<dyn mmg_microbus::component::Component>> { #build_body }
+            async fn build(&self, _bus: mmg_microbus::bus::BusHandle) -> mmg_microbus::error::Result<Box<dyn mmg_microbus::component::Component>> { #build_body }
         }
-        impl mmg_microbus::component::RegisteredComponent for #struct_ident {
-            fn kind_id() -> mmg_microbus::bus::KindId { mmg_microbus::bus::KindId::of::<#struct_ident>() }
-            fn type_name() -> &'static str { std::any::type_name::<#struct_ident>() }
-            fn factory() -> mmg_microbus::component::DynFactory { std::sync::Arc::new(#factory_ident::default()) }
-        }
+        #[doc(hidden)]
+        const _: () = {
+            fn __create_factory_for() -> Box<dyn mmg_microbus::component::ComponentFactory> { Box::new(#factory_ident::default()) }
+            inventory::submit! { mmg_microbus::component::__RegisteredFactory { create: __create_factory_for } };
+        };
     };
     expanded.into()
 }
@@ -108,10 +107,10 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     #[derive(Clone)]
     enum RetCase {
         Unit,
-        ResultUnit,
         Some,
-        ResultSome,
         OptionSome,
+        ResultUnit,
+        ResultSome,
         ResultOption,
     }
     fn analyze_return(sig: &syn::Signature) -> RetCase {
@@ -491,7 +490,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                     quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
                 }
                 RetCase::OptionSome => {
-                    quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
+                    quote! { { if let Some(__v) = #call_core.await { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
                 }
                 RetCase::ResultSome => {
                     quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "init returned error") } }
@@ -528,7 +527,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
             }
             RetCase::OptionSome => {
-                quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
+                quote! { { if let Some(__v) = #call_core.await { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
             }
             RetCase::ResultSome => {
                 quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "stop returned error") } }
@@ -568,7 +567,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                     quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
                 }
                 RetCase::OptionSome => {
-                    quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
+                    quote! { { if let Some(__v) = #call_core.await { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
                 }
                 RetCase::ResultSome => {
                     quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "handle returned error") } }
@@ -609,7 +608,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
             }
             RetCase::OptionSome => {
-                quote! { { let __opt = #call_core.await; if let Some(__v) = __opt { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
+                quote! { { if let Some(__v) = #call_core.await { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
             }
             RetCase::ResultSome => {
                 quote! { match #call_core.await { Ok(v) => mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e) => tracing::warn!(error=?e, "active returned error") } }

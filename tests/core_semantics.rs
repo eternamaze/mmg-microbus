@@ -65,9 +65,6 @@ impl Collector {
 #[tokio::test(flavor = "multi_thread")]
 async fn end_to_end_flow_and_stop() {
     let mut app = App::new(Default::default());
-    app.add_component::<Producer>("p");
-    app.add_component::<Trader>("t");
-    app.add_component::<Collector>("c");
     let _ = app.config(Cfg { n: 1 }).await.expect("config");
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;

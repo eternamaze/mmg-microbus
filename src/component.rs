@@ -1,41 +1,28 @@
-use crate::bus::{BusHandle, ComponentId, KindId};
+use crate::bus::BusHandle;
 use crate::error::Result;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt,
     sync::Arc,
 };
-use tokio::sync::watch;
+use tokio::sync::Notify;
 
-// 组件标识由 bus.rs 定义为强类型 ComponentId
 
 #[async_trait]
 pub trait Component: Send + Sync + 'static + Any {
     async fn run(self: Box<Self>, ctx: ComponentContext) -> Result<()>;
 }
 
-impl dyn Component {
-    pub fn as_any(&self) -> &dyn Any {
-        self
-    }
-    pub fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
+impl dyn Component {}
 
-/// 组件工厂：用于注册与构造组件
+/// 组件工厂：用于注册与构造组件（单例，无需 id/kind 概念）
 #[async_trait]
 pub trait ComponentFactory: Send + Sync {
-    fn kind_id(&self) -> KindId;
     fn type_name(&self) -> &'static str;
-    /// 基础构建器（无业务配置）
-    async fn build(
-        &self,
-        id: ComponentId,
-        bus: BusHandle,
-    ) -> crate::error::Result<Box<dyn Component>>;
+    async fn build(&self, bus: BusHandle) -> crate::error::Result<Box<dyn Component>>;
 }
 
 impl fmt::Debug for dyn ComponentFactory {
@@ -46,18 +33,10 @@ impl fmt::Debug for dyn ComponentFactory {
 
 pub type DynFactory = Arc<dyn ComponentFactory>;
 
-/// 标记 trait：由 #[component] 结构体实现，用于暴露工厂（无需全局扫描）
-pub trait RegisteredComponent {
-    fn kind_id() -> KindId
-    where
-        Self: Sized;
-    fn type_name() -> &'static str
-    where
-        Self: Sized;
-    fn factory() -> DynFactory
-    where
-        Self: Sized;
+pub struct __RegisteredFactory {
+    pub create: fn() -> Box<dyn ComponentFactory>,
 }
+inventory::collect!(__RegisteredFactory);
 
 // 只读配置存储：在 App::start 时冻结，运行期只读访问
 #[derive(Clone)]
@@ -75,35 +54,53 @@ impl ConfigStore {
             inner: Arc::new(map),
         }
     }
-    pub fn get<T: 'static + Send + Sync>(&self) -> Option<Arc<T>> {
-        let tid = TypeId::of::<T>();
-        self.inner
-            .get(&tid)
-            .and_then(|v| v.clone().downcast::<T>().ok())
+}
+
+pub struct StopFlag {
+    set: AtomicBool,
+    notify: Notify,
+}
+impl StopFlag {
+    pub(crate) fn new() -> Self {
+        Self {
+            set: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+    pub(crate) fn trigger(&self) {
+        if !self.set.swap(true, Ordering::Release) {
+            self.notify.notify_waiters();
+        }
+    }
+    pub(crate) fn is_set(&self) -> bool {
+        self.set.load(Ordering::Acquire)
     }
 }
 
 pub struct ComponentContext {
-    id: crate::bus::ComponentId,
+    name: String,
     bus: BusHandle,
-    // 停止信号：仅框架内部使用，不向业务暴露协作停机接口
-    stop: watch::Receiver<bool>,
+    stop: Arc<StopFlag>,
     cfg: ConfigStore,
 }
 
 impl ComponentContext {
     // 组件标识符仅供运行期内部使用；不对业务暴露寻址能力
-    pub fn id(&self) -> &crate::bus::ComponentId {
-        &self.id
+    pub fn name(&self) -> &str {
+        &self.name
     }
     pub fn new_with_service(
-        id: ComponentId,
-        _service: KindId,
+        name: String,
         bus: BusHandle,
-        stop: watch::Receiver<bool>,
+        stop: Arc<StopFlag>,
         cfg: ConfigStore,
     ) -> Self {
-        Self { id, bus, stop, cfg }
+        Self {
+            name,
+            bus,
+            stop,
+            cfg,
+        }
     }
 
     // 仅保留单一构造路径，避免歧义；组件以 kind 进行类型化
@@ -116,7 +113,7 @@ impl ComponentContext {
     #[doc(hidden)]
     pub(crate) fn __fork(&self) -> Self {
         Self {
-            id: self.id.clone(),
+            name: self.name.clone(),
             bus: self.bus.clone(),
             stop: self.stop.clone(),
             cfg: self.cfg.clone(),
@@ -155,11 +152,31 @@ pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, ms
 
 /// 内部配置读取：仅供宏使用，防止业务侧滥用
 pub fn __get_config<T: 'static + Send + Sync>(ctx: &ComponentContext) -> Option<Arc<T>> {
-    ctx.cfg.get::<T>()
+    let tid = TypeId::of::<T>();
+    ctx.cfg
+        .inner
+        .get(&tid)
+        .and_then(|v| v.clone().downcast::<T>().ok())
 }
+
+// ConfigStore 附加辅助方法已删除（简化）。
 
 /// 内部停止信号（仅供宏生成的 run() 使用）
 pub async fn __recv_stop(ctx: &ComponentContext) {
-    let mut rx = ctx.stop.clone();
-    let _ = rx.changed().await;
+    if ctx.stop.is_set() {
+        return;
+    }
+    ctx.stop.notify.notified().await;
+}
+
+// 框架内部可见：用于 App 停机触发
+pub(crate) fn __trigger_stop(ctx: &ComponentContext) {
+    ctx.stop.trigger();
+}
+
+pub(crate) fn __new_stop_flag() -> Arc<StopFlag> {
+    Arc::new(StopFlag::new())
+}
+pub(crate) fn __trigger_stop_flag(flag: &Arc<StopFlag>) {
+    flag.trigger();
 }

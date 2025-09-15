@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
 smallvec = "1"
 microbus-macros = { path = "./microbus-macros" }
 parking_lot = "0.12"
+inventory = "0.3"
 
 [lib]
 name = "mmg_microbus"

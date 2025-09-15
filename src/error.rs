@@ -3,8 +3,6 @@ use std::{error::Error as StdError, fmt};
 
 #[derive(Debug)]
 pub enum MicrobusError {
-    NoComponents,                // 启动时未注册组件
-    UnknownComponentKind,        // 注册的 kind 在工厂表中缺失（理论上不应出现）
     MissingConfig(&'static str), // #[init] 所需配置缺失
     Other(&'static str),         // 简单静态消息
     Dynamic(String),             // 动态字符串（极少使用）
@@ -13,8 +11,6 @@ pub enum MicrobusError {
 impl fmt::Display for MicrobusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MicrobusError::NoComponents => write!(f, "no components configured"),
-            MicrobusError::UnknownComponentKind => write!(f, "unknown component kind"),
             MicrobusError::MissingConfig(t) => write!(f, "missing config for init: {t}"),
             MicrobusError::Other(msg) => write!(f, "{msg}"),
             MicrobusError::Dynamic(s) => write!(f, "{s}"),

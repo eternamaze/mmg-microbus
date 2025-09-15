@@ -1,9 +1,8 @@
-//! 单文件全功能示例：
-//! - 唯一解耦路径：函数参数注入（上下文、消息、配置）
-//! - 统一注解模型（#[component]/#[handle]/#[active]）
-//! - 主动函数（#[active]）与被动订阅（#[handle]）
-//! - 路由：仅按消息类型（不再有实例过滤/地址）
-//! - 强类型配置（app.config，#[init] 以 &Cfg 注入，允许可选 &Context）
+//! 单文件示例：展示最小框架语义 + 六类返回值自动发布集合。
+//! 返回类型支持：
+//! - () / Result<()> : 不发布
+//! - T / Result<T> : 成功发布一条
+//! - Option<T> / Result<Option<T>> : Some(T) 发布
 
 use mmg_microbus::prelude::*;
 
@@ -22,7 +21,7 @@ struct TraderCfg {
     min_tick: u64,
 }
 
-// ---- 主动消息源组件：定时发布 Tick ----
+// ---- 主动消息源组件：定时发布 Tick，并演示多种返回类型 ----
 #[mmg_microbus::component]
 #[derive(Default)]
 struct Feeder;
@@ -30,11 +29,60 @@ struct Feeder;
 #[mmg_microbus::component]
 impl Feeder {
     // 展示主动函数：无限循环（框架协作式 yield，函数每完成一次立即再调度）
+    // 1) 返回 T
     #[mmg_microbus::active]
     async fn tick(&self, _ctx: &mmg_microbus::component::ComponentContext) -> Tick {
         static CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         Tick(n)
+    }
+
+    // 2) 返回 Option<T>
+    #[mmg_microbus::active]
+    async fn maybe_price(&self) -> Option<Price> {
+        // 只发布偶数 tick 对应的 Price
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static P: AtomicU64 = AtomicU64::new(0);
+        let n = P.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 2 == 0 {
+            Some(Price(n as f64))
+        } else {
+            None
+        }
+    }
+
+    // 3) 返回 Result<T>
+    #[mmg_microbus::active]
+    async fn result_tick(&self) -> Result<Tick> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static R: AtomicU64 = AtomicU64::new(0);
+        let n = R.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(Tick(10_000 + n))
+    }
+
+    // 4) 返回 Result<Option<T>>
+    #[mmg_microbus::active]
+    async fn result_maybe(&self) -> Result<Option<Price>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static Q: AtomicU64 = AtomicU64::new(0);
+        let n = Q.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 3 == 0 {
+            Ok(Some(Price(1000.0 + n as f64)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // 5) 返回 () （不发布）
+    #[mmg_microbus::active]
+    async fn heartbeat(&self) { /* no-op */
+    }
+
+    // 6) 返回 Result<()> （不发布；错误只记录 Warn）
+    #[mmg_microbus::active]
+    async fn maybe_err(&self) -> Result<()> {
+        // 构造一个永远 Ok 的示例；可改成 Err(anyhow!("boom")) 观察 warn
+        Ok(())
     }
 }
 
@@ -53,7 +101,7 @@ impl Trader {
         self.cfg = Some(cfg.clone());
         Ok(())
     }
-    // 订阅 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态）
+    // 订阅 Tick；注入 &ComponentContext 与 &Tick（配置已在 #[init] 保存到状态） -> 返回 Option<T>
     #[mmg_microbus::handle]
     async fn on_tick(
         &mut self,
@@ -69,7 +117,7 @@ impl Trader {
         }
     }
 
-    // 简化：不区分来源；消息类型即订阅
+    // 返回 Result<()> （不发布）
     #[mmg_microbus::handle]
     async fn on_price_binance(
         &mut self,
@@ -81,7 +129,7 @@ impl Trader {
         Ok(())
     }
 
-    // 展示可选的 Ack 发布（匹配 Trader 类型的监听者）
+    // 返回 Result<()> 另一示例
     #[mmg_microbus::handle]
     async fn on_any_price(
         &mut self,
@@ -92,16 +140,14 @@ impl Trader {
         Ok(())
     }
 
-    // 停止钩子：框架停机时同步调用一次，返回值将自动发布
+    // 停止钩子：返回 T 被发布
     #[mmg_microbus::stop]
     async fn on_stop(&self) -> Stopped {
         Stopped("bye")
     }
 }
 
-// ---- 实例使用字符串 ID（不再需要强类型实例标记/服务类型） ----
-
-// 收集停止消息，展示返回值自动发布在停机时仍然有效
+// 收集停止消息，展示停机时返回值仍会发布
 #[mmg_microbus::component]
 #[derive(Default)]
 struct Collector;
@@ -117,10 +163,7 @@ impl Collector {
 async fn main() -> Result<()> {
     // App 是唯一控制入口
     let mut app = App::new(Default::default());
-    // 注册组件实例（类型安全）
-    app.add_component::<Feeder>("feeder-1");
-    app.add_component::<Trader>("trader-1");
-    app.add_component::<Collector>("collector-1");
+    // 单例自动发现：无需显式 add_component
     // 注入强类型配置（可多项）
     app.config(TraderCfg {
         symbol: "BTCUSDT".into(),

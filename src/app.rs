@@ -1,23 +1,21 @@
-use crate::error::{MicrobusError, Result};
+use crate::error::Result;
 use std::any::TypeId;
 use tokio::task::JoinHandle;
 
 use crate::{
     bus::{Bus, BusHandle},
-    component::{ComponentContext, ConfigStore, RegisteredComponent},
-    config::{AppConfig, ComponentConfig},
+    component::{
+        ComponentContext, ConfigStore, __RegisteredFactory, __new_stop_flag, __trigger_stop_flag,
+    },
+    config::AppConfig,
 };
 
 pub struct App {
-    cfg: AppConfig,
+    _cfg: AppConfig,
     bus: Bus,
     tasks: Vec<JoinHandle<()>>,
     started: bool,
-    stop_tx: tokio::sync::watch::Sender<bool>,
-    factories: std::collections::HashMap<
-        crate::bus::KindId,
-        std::sync::Arc<dyn crate::component::ComponentFactory>,
-    >,
+    stop_flag: std::sync::Arc<crate::component::StopFlag>,
     // 启动前暂存的配置条目（类型 -> Arc<T>），启动时冻结为只读 ConfigStore
     cfg_map: std::collections::HashMap<
         std::any::TypeId,
@@ -29,34 +27,16 @@ pub struct App {
 impl App {
     pub fn new(cfg: AppConfig) -> Self {
         let bus = Bus::new(cfg.queue_capacity);
-        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let stop_flag = __new_stop_flag();
         Self {
-            cfg,
+            _cfg: cfg,
             bus,
             tasks: Vec::new(),
             started: false,
-            stop_tx: tx,
-            factories: std::collections::HashMap::new(),
+            stop_flag,
             cfg_map: std::collections::HashMap::new(),
             frozen_cfg: None,
         }
-    }
-
-    /// 以类型安全的方式注册组件实例并登记其工厂，避免外部硬编码类型名字符串。
-    pub fn add_component<T: RegisteredComponent + 'static>(
-        &mut self,
-        id: impl Into<String>,
-    ) -> &mut Self {
-        let kind = <T as RegisteredComponent>::kind_id();
-        // 注册工厂（若未注册）
-        self.factories
-            .entry(kind)
-            .or_insert_with(|| <T as RegisteredComponent>::factory());
-        self.cfg.components.push(ComponentConfig {
-            id: id.into(),
-            kind,
-        });
-        self
     }
 
     /// 配置入口（单项）：
@@ -105,11 +85,7 @@ impl App {
         if self.started {
             return Ok(());
         }
-        // 统一入口：必须显式装配组件。若未配置，立即报错，避免出现多种装配体验。
-        if self.cfg.components.is_empty() {
-            return Err(MicrobusError::NoComponents);
-        }
-        // 冻结配置存储
+        // 冻结配置存储（单例自动发现模式下，不再需要外部 add_component 装配）
         let cfg_store = if let Some(f) = self.frozen_cfg.clone() {
             f
         } else {
@@ -117,44 +93,29 @@ impl App {
             self.frozen_cfg = Some(frozen.clone());
             frozen
         };
-        // 工厂表来自 add_component 阶段登记的 KindId -> Factory
-
-        // 路由：仅按消息类型 fanout，无额外拓扑或单例检查
-
-        let handle = self.bus.handle();
-        for cc in self.cfg.components.iter() {
-            // 查表匹配配置的 kind（KindId）
-            let factory = match self.factories.get(&cc.kind) {
-                Some(f) => f.clone(),
-                None => {
-                    return Err(MicrobusError::UnknownComponentKind);
-                }
-            };
-            let id = cc.id.clone();
-            let bus_handle = handle.clone();
-            let kind_id = factory.kind_id();
-            let rx = self.stop_tx.subscribe();
+        // 自动发现：inventory 收集的所有工厂；按 kind 去重（单例模式）。
+        let bus_handle = self.bus.handle();
+        for reg in inventory::iter::<__RegisteredFactory> {
+            let factory = (reg.create)();
+            let name = factory.type_name().to_string();
+            let stop_clone = self.stop_flag.clone();
+            let bus_clone = bus_handle.clone();
             let cfg_store_i = cfg_store.clone();
             let fut = async move {
-                let built = factory
-                    .build(crate::bus::ComponentId(id.clone()), bus_handle.clone())
-                    .await;
-                match built {
+                match factory.build(bus_clone.clone()).await {
                     Ok(comp) => {
                         let ctx = ComponentContext::new_with_service(
-                            crate::bus::ComponentId(id.clone()),
-                            kind_id,
-                            bus_handle.clone(),
-                            rx.clone(),
+                            name.clone(),
+                            bus_clone.clone(),
+                            stop_clone.clone(),
                             cfg_store_i.clone(),
                         );
-                        // 运行组件（组件通过参数注入获取上下文、消息与配置）
                         if let Err(e) = comp.run(ctx).await {
-                            tracing::error!(component = %id, kind = %factory.type_name(), error = %e, "component exited with error");
+                            tracing::error!(component = %name, kind = %factory.type_name(), error = %e, "component exited with error");
                         }
                     }
                     Err(e) => {
-                        tracing::error!(component = %id, kind = %factory.type_name(), error = %e, "failed to build component");
+                        tracing::error!(component = %name, kind = %factory.type_name(), error = %e, "failed to build component");
                     }
                 }
             };
@@ -165,14 +126,14 @@ impl App {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         // 冻结 bus：后续不再期望新增订阅
-        handle.seal();
+        self.bus.handle().seal();
         self.started = true;
         Ok(())
     }
     pub async fn stop(&mut self) {
         // 框架主导的单方面停机：
         // 1) 发出停止信号；
-        let _ = self.stop_tx.send(true);
+        __trigger_stop_flag(&self.stop_flag);
         // 2) 强制结束所有组件任务（无需等待其“自然退出”）。
         let mut rest = Vec::new();
         rest.append(&mut self.tasks);

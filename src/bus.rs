@@ -1,5 +1,3 @@
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ComponentId(pub String);
 use smallvec::SmallVec;
 
 use parking_lot::RwLock;
@@ -7,24 +5,10 @@ use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt,
-    hash::Hash,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
 };
 use tokio::sync::mpsc;
-
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-pub struct KindId(TypeId);
-impl KindId {
-    pub fn of<T: 'static>() -> Self {
-        KindId(TypeId::of::<T>())
-    }
-}
-impl fmt::Debug for KindId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "KindId(..)")
-    }
-}
 
 // 类型级 fanout 路由（按消息类型广播，不做拓扑/主题分层）
 
