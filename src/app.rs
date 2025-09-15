@@ -122,6 +122,11 @@ impl App {
         // 路由：仅按消息类型 fanout，无额外拓扑或单例检查
 
         let handle = self.bus.handle();
+        
+        // 创建组件准备状态协调屏障（确保所有组件完成订阅设置后才执行 active(once)）
+        let component_count = self.cfg.components.len();
+        let ready_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(component_count));
+        
         for cc in self.cfg.components.iter() {
             // 查表匹配配置的 kind（KindId）
             let factory = match self.factories.get(&cc.kind) {
@@ -135,18 +140,20 @@ impl App {
             let kind_id = factory.kind_id();
             let rx = self.stop_tx.subscribe();
             let cfg_store_i = cfg_store.clone();
+            let barrier = ready_barrier.clone();
             let fut = async move {
                 let built = factory
                     .build(crate::bus::ComponentId(id.clone()), bus_handle.clone())
                     .await;
                 match built {
                     Ok(comp) => {
-                        let ctx = ComponentContext::new_with_service(
+                        let ctx = ComponentContext::new_with_barrier(
                             crate::bus::ComponentId(id.clone()),
                             kind_id,
                             bus_handle.clone(),
                             rx.clone(),
                             cfg_store_i.clone(),
+                            barrier,
                         );
                         // 运行组件（组件通过参数注入获取上下文、消息与配置）
                         if let Err(e) = comp.run(ctx).await {

@@ -643,10 +643,8 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     let mut __once_done = false;
     // Active loop 分支：无调度间隔；无消息就绪时立即执行（最小延迟）
                 // 主循环：选择消息、主动任务与框架停机信号；收到停机信号即退出。
-                // 单次让出，保证其它组件已进入 run 并完成自身订阅
-                tokio::task::yield_now().await;
-                // 额外让出，确保所有组件有足够时间完成订阅设置
-                tokio::task::yield_now().await;
+                // 等待所有组件完成订阅设置（真正的异步协调，不依赖调度随机性）
+                mmg_microbus::component::__wait_for_all_components_ready(&ctx).await;
                 loop {
                     if !__once_done { { #( #once_calls )* } __once_done = true; }
                     tokio::select! {

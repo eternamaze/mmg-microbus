@@ -89,6 +89,8 @@ pub struct ComponentContext {
     // 停止信号：仅框架内部使用，不向业务暴露协作停机接口
     stop: watch::Receiver<bool>,
     cfg: ConfigStore,
+    // 组件准备状态协调
+    ready_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 impl ComponentContext {
@@ -103,7 +105,18 @@ impl ComponentContext {
         stop: watch::Receiver<bool>,
         cfg: ConfigStore,
     ) -> Self {
-        Self { id, bus, stop, cfg }
+        Self { id, bus, stop, cfg, ready_barrier: None }
+    }
+
+    pub fn new_with_barrier(
+        id: ComponentId,
+        _service: KindId,
+        bus: BusHandle,
+        stop: watch::Receiver<bool>,
+        cfg: ConfigStore,
+        ready_barrier: std::sync::Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        Self { id, bus, stop, cfg, ready_barrier: Some(ready_barrier) }
     }
 
     // 仅保留单一构造路径，避免歧义；组件以 kind 进行类型化
@@ -120,6 +133,7 @@ impl ComponentContext {
             bus: self.bus.clone(),
             stop: self.stop.clone(),
             cfg: self.cfg.clone(),
+            ready_barrier: self.ready_barrier.clone(),
         }
     }
 }
@@ -162,4 +176,11 @@ pub fn __get_config<T: 'static + Send + Sync>(ctx: &ComponentContext) -> Option<
 pub async fn __recv_stop(ctx: &ComponentContext) {
     let mut rx = ctx.stop.clone();
     let _ = rx.changed().await;
+}
+
+/// 内部等待所有组件准备就绪（仅供宏生成的 run() 使用）
+pub async fn __wait_for_all_components_ready(ctx: &ComponentContext) {
+    if let Some(barrier) = &ctx.ready_barrier {
+        barrier.wait().await;
+    }
 }
