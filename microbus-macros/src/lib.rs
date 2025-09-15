@@ -1,12 +1,18 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-// removed unused Parse traits after simplifying active parsing
 use syn::Ident;
 use syn::{parse_macro_input, Attribute, Item, ItemImpl, ItemStruct, Type};
 
-// 仅保留强类型“方法即订阅”路径。
-
-// 组件工厂通过 #[component] 结构体注解自动生成（单一构造路径）
+// -------------------------------------------------------------------------------------------------
+// 微总线宏实现（最小模型）：
+// - #[component]   : 标注 struct / impl；struct 侧生成工厂 + inventory 注册；impl 侧生成 run()
+// - #[handle]      : (&ComponentContext?, &T) -> 六类返回之一；返回值自动发布（成功 / Some）
+// - #[active]      : 主动函数（loop 或 once）；once 在所有订阅建立 & 屏障释放后执行一次
+// - #[init]        : (&self mut, &CfgType[, &ComponentContext]) -> 六类返回之一；缺配置报错中止
+// - #[stop]        : (&self[/&mut self][, &ComponentContext]) -> 六类返回之一；组件退出前调用
+// 返回类型统一六类：(), Result<()>, T, Result<T>, Option<T>, Result<Option<T>>
+// 发布约束：每次入口调用最多发布 0/1 条；错误仅 warn，不中断主循环。
+// -------------------------------------------------------------------------------------------------
 
 #[proc_macro_attribute]
 pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -49,16 +55,7 @@ fn component_for_impl(item: ItemImpl) -> TokenStream {
     generate_run_impl_inner(item, &self_ty)
 }
 
-// 配置注入：在 #[init] 方法签名中以 &CfgType 参数体现
-
-// --- 方法即订阅（强类型，&T-only） + 生命周期钩子 ---
-// 用法（新）：
-//   #[mmg_microbus::component]
-//   impl MyComp {
-//       #[mmg_microbus::handle]
-//       async fn on_tick(&mut self, ctx: &mmg_microbus::component::ComponentContext, tick: &Tick) -> mmg_microbus::error::Result<()> { Ok(()) }
-//   }
-// 说明：仅支持签名 (&ComponentContext, &T)，必须显式标注 #[handle]
+// 说明 (handle)：签名 (&ComponentContext?, &T)；T 为订阅消息类型；其返回值按六类规则自动发布。
 
 #[proc_macro_attribute]
 pub fn handle(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -79,7 +76,7 @@ pub fn stop(_args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
-    // 解析 #[handle]：不允许任何参数
+    // 解析 #[handle]
     #[derive(Default, Clone)]
     struct HandleAttr {
         has_args: bool,
@@ -184,7 +181,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     }
 
     let mut methods: Vec<MethodSpec> = Vec::new();
-    // Active methods
+    // Active 方法收集
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ActiveKind {
         Loop,
@@ -314,7 +311,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
             if !is_active {
                 continue;
             }
-            // forbid &mut self to avoid concurrent mutable borrow in select loop
+            // 禁止 #[active] 使用 &mut self（循环 select 中保持可重入安全）
             if let Some(rcv) = m.sig.receiver() {
                 if rcv.mutability.is_some() {
                     let err = syn::Error::new_spanned(
@@ -326,7 +323,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
             }
             let mut wants_ctx = false;
             let mut extra_ref_params: Vec<Type> = Vec::new();
-            // no extra annotations needed
+            // 检查参数（允许可选 ctx；禁止额外 &T）
             for arg in &m.sig.inputs {
                 match arg {
                     syn::FnArg::Receiver(_) => {}
@@ -357,9 +354,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         }
     }
 
-    // 生成 run()：为每个 handle 创建订阅，并在 select 循环中分发
-    // 收集 #[init] 与 #[stop]
-    // #[init]: 允许 self + 可选 &ComponentContext + 恰好一个 &CfgType
+    // 收集 #[init] / #[stop] 方法元信息
     struct InitSpec {
         ident: syn::Ident,
         wants_ctx: bool,
@@ -393,7 +388,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 }
             }
             if has_init || has_stop {
-                // 收集 #[init] 的参数（严格：恰好一个 &CfgType；允许可选 ctx）
+                // #[init]：严格一个 &CfgType；允许可选 ctx
                 if has_init {
                     let mut cfg_ty: Option<Type> = None;
                     let mut param_count = 0usize;
@@ -436,7 +431,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                         ret_case: rc,
                     });
                 }
-                // 校验 #[stop]：只允许接收器（&self 或 &mut self），不允许其他参数
+                // #[stop]：只允许 self / &mut self 和可选 ctx
                 if has_stop {
                     let mut extraneous = Vec::new();
                     let mut wants_ctx = false;
@@ -474,7 +469,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         let ident = &i.ident;
         let call_expr = if let Some(cty) = &i.cfg_ty {
             let var = format_ident!("__icfg_{}", ident);
-            // 严格：恰好一个 &Cfg 参数，且可选 ctx
+            // 严格：一个 &Cfg 参数 + 可选 ctx
             let call_core = if i.wants_ctx {
                 quote! { this.#ident(&ctx, &*#var) }
             } else {
@@ -504,7 +499,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
                 if let Some(#var) = #var { #ret } else { return Err(mmg_microbus::error::MicrobusError::MissingConfig(stringify!(#cty))); }
             }}
         } else {
-            // 不应出现：#[init] 必须提供一个 &CfgType；若宏到此仍无类型，静默不生成调用。
+            // 理论上不会出现：#[init] 必须提供 &CfgType
             quote! {}
         };
         init_calls.push(call_expr);
@@ -540,24 +535,24 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
     }
     let mut sub_decls = Vec::new();
     let mut select_arms = Vec::new();
-    // prepare active tickers and state
+    // 生成订阅与 select 分支
     let mut active_arms = Vec::new();
     for (idx, ms) in methods.iter().enumerate() {
         let ty = &ms.msg_ty;
         let method_ident = &ms.ident;
         {
-            // 订阅任意来源（类型级）
+            // 订阅（类型级 fanout）
             let sub_var = format_ident!("__sub_any_{}", idx);
             sub_decls.push(quote! {
                 let mut #sub_var = mmg_microbus::component::__subscribe_any_auto::<#ty>(&ctx).await;
             });
-            // handle 仅支持可选 ctx 和单一消息 &T
+            // 调用包装（handle）
             let call_core = if ms.wants_ctx {
                 quote! { this.#method_ident(&ctx, &*env) }
             } else {
                 quote! { this.#method_ident(&*env) }
             };
-            // 根据返回类型自动处理发布：T / Result<T> 自动 publish；() / Result<()> 仅记录错误
+            // 返回调度（六类）
             let call_expr = match &ms.ret_case {
                 RetCase::Unit => quote! { let _ = #call_core.await; },
                 RetCase::ResultUnit => {
@@ -589,7 +584,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         }
     }
 
-    // Active 调度： once 类直接在循环前调用； loop 类合并为单一 select 分支（yield 驱动公平）
+    // Active 调度：once 类启动前屏障后执行；loop 类作为永远就绪分支
     let mut once_calls = Vec::new();
     let mut loop_call_bodies = Vec::new();
     for a in actives.iter() {
@@ -624,7 +619,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         }
     }
     if !loop_call_bodies.is_empty() {
-        // 永远就绪的分支：若前面消息分支均未就绪，则立即执行全部 loop-active；实现“尽可能快”语义
+    // loop-active 永远就绪分支
         active_arms.push(quote! { _ = async {} => { #( #loop_call_bodies )* } });
     }
 
@@ -638,14 +633,14 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         #( #init_calls )*
     // 为每个处理方法建立强类型订阅
                 #(#sub_decls)*
-    // once-active 延迟到主循环首轮内执行（避免在其他组件尚未订阅前发布）
-    let mut __once_done = false;
-    // Active loop 分支：无调度间隔；无消息就绪时立即执行（最小延迟）
-                // 主循环：选择消息、主动任务与框架停机信号；收到停机信号即退出。
-                // 单次让出，保证其它组件已进入 run 并完成自身订阅
+    // 屏障：所有组件完成订阅后统一释放
+                mmg_microbus::component::__startup_arrive_and_wait(&ctx).await;
+    // 先执行一次 once-active（发布将被所有订阅者接收）
+                { #( #once_calls )* }
+    // 让出一次调度，给予其他组件处理初始消息的机会
                 tokio::task::yield_now().await;
+    // 主循环：消息处理 + loop-active + 停机信号
                 loop {
-                    if !__once_done { { #( #once_calls )* } __once_done = true; }
                     tokio::select! {
                         #(#select_arms)*
                         #(#active_arms)*

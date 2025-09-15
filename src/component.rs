@@ -1,7 +1,7 @@
 use crate::bus::BusHandle;
 use crate::error::Result;
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -81,6 +81,7 @@ pub struct ComponentContext {
     bus: BusHandle,
     stop: Arc<StopFlag>,
     cfg: ConfigStore,
+    startup: Arc<StartupBarrier>,
 }
 
 impl ComponentContext {
@@ -93,12 +94,14 @@ impl ComponentContext {
         bus: BusHandle,
         stop: Arc<StopFlag>,
         cfg: ConfigStore,
+        startup: Arc<StartupBarrier>,
     ) -> Self {
         Self {
             name,
             bus,
             stop,
             cfg,
+            startup,
         }
     }
 
@@ -116,6 +119,7 @@ impl ComponentContext {
             bus: self.bus.clone(),
             stop: self.stop.clone(),
             cfg: self.cfg.clone(),
+            startup: self.startup.clone(),
         }
     }
 }
@@ -178,4 +182,41 @@ pub(crate) fn __new_stop_flag() -> Arc<StopFlag> {
 }
 pub(crate) fn __trigger_stop_flag(flag: &Arc<StopFlag>) {
     flag.trigger();
+}
+
+// 启动屏障：确保 active(once) 发布在所有组件完成订阅后才发生，避免竞态丢失一次性消息
+pub struct StartupBarrier {
+    total: usize,
+    arrived: AtomicUsize,
+    notify: Notify,
+}
+impl StartupBarrier {
+    pub fn new(total: usize) -> Self {
+        Self {
+            total,
+            arrived: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+    async fn arrive_and_wait(&self) {
+        let n = self.arrived.fetch_add(1, Ordering::AcqRel) + 1;
+        if n == self.total {
+            self.notify.notify_waiters();
+            return;
+        }
+        // 等待所有组件到达
+        loop {
+            if self.arrived.load(Ordering::Acquire) >= self.total {
+                break;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+pub(crate) fn __new_startup_barrier(total: usize) -> Arc<StartupBarrier> {
+    Arc::new(StartupBarrier::new(total))
+}
+pub async fn __startup_arrive_and_wait(ctx: &ComponentContext) {
+    ctx.startup.arrive_and_wait().await;
 }

@@ -5,7 +5,8 @@ use tokio::task::JoinHandle;
 use crate::{
     bus::{Bus, BusHandle},
     component::{
-        ComponentContext, ConfigStore, __RegisteredFactory, __new_stop_flag, __trigger_stop_flag,
+        ComponentContext, ConfigStore, __RegisteredFactory, __new_startup_barrier, __new_stop_flag,
+        __trigger_stop_flag,
     },
     config::AppConfig,
 };
@@ -95,12 +96,17 @@ impl App {
         };
         // 自动发现：inventory 收集的所有工厂；按 kind 去重（单例模式）。
         let bus_handle = self.bus.handle();
-        for reg in inventory::iter::<__RegisteredFactory> {
+        let factories: Vec<&__RegisteredFactory> =
+            inventory::iter::<__RegisteredFactory>.into_iter().collect();
+        let total = factories.len();
+        let startup_barrier = __new_startup_barrier(total);
+        for reg in factories.into_iter() {
             let factory = (reg.create)();
             let name = factory.type_name().to_string();
             let stop_clone = self.stop_flag.clone();
             let bus_clone = bus_handle.clone();
             let cfg_store_i = cfg_store.clone();
+            let barrier_clone = startup_barrier.clone();
             let fut = async move {
                 match factory.build(bus_clone.clone()).await {
                     Ok(comp) => {
@@ -109,6 +115,7 @@ impl App {
                             bus_clone.clone(),
                             stop_clone.clone(),
                             cfg_store_i.clone(),
+                            barrier_clone.clone(),
                         );
                         if let Err(e) = comp.run(ctx).await {
                             tracing::error!(component = %name, kind = %factory.type_name(), error = %e, "component exited with error");
