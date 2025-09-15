@@ -619,7 +619,7 @@ fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> TokenStream {
         }
     }
     if !loop_call_bodies.is_empty() {
-    // loop-active 永远就绪分支
+        // loop-active 永远就绪分支
         active_arms.push(quote! { _ = async {} => { #( #loop_call_bodies )* } });
     }
 
