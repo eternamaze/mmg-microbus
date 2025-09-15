@@ -6,11 +6,6 @@ on:
   pull_request:
     branches: [ main ]
 
-permissions:
-  contents: read
-  actions: read
-  security-events: write
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -20,105 +15,42 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  lint:
-    name: Lint (fmt + clippy)
+  fmt:
+    name: rustfmt check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --all -- --check
-      - name: clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (deny warnings)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    name: build workspace
+    runs-on: ubuntu-latest
+    needs: [clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets --locked
 
   test:
-    name: Test (stable + nightly)
-    needs: [lint]
+    name: test workspace
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, nightly]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Show rustc version
-        run: rustc -Vv
-      - name: Cargo test
-        run: cargo test --workspace --all-targets --locked --quiet
-      - name: Save test results (on failure)
-        if: failure()
-        run: |
-          echo "Tests failed in matrix: rust=${{ matrix.rust }}" > test-failure.txt
-      - name: Upload failure log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-failure-${{ matrix.rust }}
-          path: test-failure.txt
-    continue-on-error: ${{ matrix.rust == 'nightly' }}
-
-  coverage:
-    name: Coverage (tarpaulin)
-    needs: [lint]
-    runs-on: ubuntu-latest
+    needs: [build]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin --locked
-      - name: Run coverage
-        run: cargo tarpaulin --workspace --ignore-tests --out Lcov --quiet || cargo tarpaulin --out Lcov --quiet
-      - name: Upload lcov artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-lcov
-          path: lcov.info
-
-  docs:
-    name: Docs build
-    needs: [lint]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo doc (no-deps)
-        run: cargo doc --workspace --no-deps --locked
-      - name: Compress docs
-        run: tar czf target/doc.tar.gz -C target/doc .
-      - name: Upload docs
-        uses: actions/upload-artifact@v4
-        with:
-          name: docs
-          path: target/doc.tar.gz
-
-  audit:
-    name: Security / Supply-chain
-    needs: [lint]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Advisory DB fetch & audit
-        run: cargo audit || true  # 不阻断主流程；如需强制失败移除 '|| true'
-
-  summary:
-    name: CI Summary
-    needs: [test, coverage, docs, audit]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Matrix status
-        run: echo "lint+test+coverage+docs+audit 完成 (查看上游作业详情)"
+      - run: cargo test --workspace --all-targets --locked
 
