@@ -2,12 +2,7 @@ use crate::bus::BusHandle;
 use crate::error::Result;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-    fmt,
-    sync::Arc,
-};
+use std::{any::Any, fmt, sync::Arc};
 use tokio::sync::Notify;
 
 #[async_trait]
@@ -37,24 +32,6 @@ pub struct __RegisteredFactory {
 }
 inventory::collect!(__RegisteredFactory);
 
-// 只读配置存储：在 App::start 时冻结，运行期只读访问
-#[derive(Clone)]
-pub struct ConfigStore {
-    inner: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
-}
-impl ConfigStore {
-    pub fn empty() -> Self {
-        Self {
-            inner: Arc::new(HashMap::new()),
-        }
-    }
-    pub fn from_frozen_map(map: HashMap<TypeId, Arc<dyn Any + Send + Sync>>) -> Self {
-        Self {
-            inner: Arc::new(map),
-        }
-    }
-}
-
 pub struct StopFlag {
     set: AtomicBool,
     notify: Notify,
@@ -80,7 +57,6 @@ pub struct ComponentContext {
     name: String,
     bus: BusHandle,
     stop: Arc<StopFlag>,
-    cfg: ConfigStore,
     startup: Arc<StartupBarrier>,
 }
 
@@ -93,14 +69,12 @@ impl ComponentContext {
         name: String,
         bus: BusHandle,
         stop: Arc<StopFlag>,
-        cfg: ConfigStore,
         startup: Arc<StartupBarrier>,
     ) -> Self {
         Self {
             name,
             bus,
             stop,
-            cfg,
             startup,
         }
     }
@@ -118,13 +92,12 @@ impl ComponentContext {
             name: self.name.clone(),
             bus: self.bus.clone(),
             stop: self.stop.clone(),
-            cfg: self.cfg.clone(),
             startup: self.startup.clone(),
         }
     }
 }
 
-// 配置注入：仅在 #[init] 中通过 &CfgType 注入一次；运行期只读，由组件自身持有
+// (已移除外部配置注入模型) 保留空行占位，避免误解：组件自管内部初始化，不支持 #[init](&Cfg)
 
 /// 订阅封装（不含协作停机）
 pub struct AutoSubscription<T> {
@@ -153,16 +126,7 @@ pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, ms
     ctx.bus.publish_type(msg).await;
 }
 
-/// 内部配置读取：仅供宏使用，防止业务侧滥用
-pub fn __get_config<T: 'static + Send + Sync>(ctx: &ComponentContext) -> Option<Arc<T>> {
-    let tid = TypeId::of::<T>();
-    ctx.cfg
-        .inner
-        .get(&tid)
-        .and_then(|v| v.clone().downcast::<T>().ok())
-}
-
-// ConfigStore 附加辅助方法已删除（简化）。
+// 配置相关能力已移除：init 仅由组件自身内部逻辑决定，其它注入路径删除。
 
 /// 内部停止信号（仅供宏生成的 run() 使用）
 pub async fn __recv_stop(ctx: &ComponentContext) {

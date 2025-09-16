@@ -17,14 +17,14 @@
 ## 生命周期全流程
 1) 组装
 - 构造 App：`let mut app = App::new(Default::default());`
-- （已收敛单例）组件无需显式注册：凡使用 `#[component]` 标注的结构体会在编译期登记并于 `start()` 自动实例化一次。
-- 注入配置（可选、可多种类型）：`app.config(MyCfg { .. }).await?`（同类型后写覆盖，最后值生效）。
+- 组件单例自动发现：凡使用 `#[component]` 标注的结构体会在编译期登记并于 `start()` 自动实例化一次。
+- （已移除）外部业务配置注入能力：不再有 `app.config()`；组件初始化所需数据由组件自身在 `#[init]` 内获取（硬编码 / 读取文件 / 环境变量等）。
 
 2) 启动
-- `app.start().await?`：执行下列步骤：
-  - 初始化：为每个组件调用 `#[init]`（若存在）。若该组件声明了 `&Cfg` 但未注入，启动失败返回错误。
-  - 订阅装配：扫描组件方法签名，凡 `#[handle]` 且含单个 `&T`，即向总线注册对 T 的订阅。
-  - 主动任务调度：为每个 `#[active]` 方法确定模式：`#[active]` 无限循环（协作式 yield），`#[active(once)]` 执行一次。
+- `app.start().await?`：
+  - 初始化阶段：为每个组件调用其 `#[init]` 方法（若存在）。不再解析任何外部配置参数，`#[init]` 只能接受 `(self/&mut self)` + 可选 `&ComponentContext`。
+  - 订阅装配：扫描 `#[handle]` 方法签名建立类型级订阅。
+  - 主动任务调度：`#[active]` 进入循环；`#[active(once)]` 启动后执行一次。
 
 3) 运行期
 - 被动消费：总线按“消息类型”将消息 fanout 给所有订阅者；对应 `#[handle]` 以消息 `&T` 为入参被调用。
@@ -56,10 +56,9 @@
   - 返回：见“返回值即发布”。
 
 - `#[init]`（初始化）：
-  - 形参：可选 `&ComponentContext` + 恰好一个 `&Cfg`（业务配置类型）。
-  - 行为：App 启动前从配置仓库取出 `Cfg` 调用该方法；缺失则启动失败（返回 `MicrobusError::MissingConfig`).
-  - 建议：将 `Cfg` 克隆/拷贝到组件状态以供后续使用。
-  - 返回：见“返回值即发布”。
+  - 形参：仅允许 `(self 或 &mut self)` 加可选 `&ComponentContext`。
+  - 行为：框架在组件 run 进入主循环前调用一次；组件内部自行获取或构造所需配置；框架不感知来源与形式。
+  - 返回：同统一六类（返回值即发布）。
 
 - `#[stop]`（停止）：
   - 形参：仅可选 `&ComponentContext`。
@@ -78,11 +77,13 @@
 - 无任意发布 / 动态订阅接口：路由绑定全部在启动阶段静态生成。
 - 无反射逃逸：不提供 `as_any` 之类方法。
 
-## 配置注入模型
-- 框架配置（AppConfig）：仅在 `App::new(AppConfig)` 提供；业务配置通过 `app.config(..)` 注入。
-- 业务配置：`app.config(Cfg { .. }).await?`；同类型多次写入后写覆盖（建议在日志层给出覆盖提示）。
-- 读取：仅框架在调用 `#[init]` 时按声明类型读取；业务运行期不可随意读取。
-- 失败：若组件声明了 `#[init](&Cfg)` 但缺少该配置，`start()` 返回错误。
+## （已移除）外部业务配置注入
+原先的 `app.config()` / `ConfigStore` / `#[init](&Cfg)` 模式已删除。现在：
+- 若组件需要外部参数，可：
+  1. 在 `#[init]` 中读取环境变量/文件；
+  2. 使用编译期常量；
+  3. 通过其它组件发布的消息在运行期渐进获取；
+- 框架不再提供缺配置检测或存储。
 
 ## 停机（非协作）
 - 停止：调用 `stop()` 结束；若存在 `#[stop]` 则调用后结束。
@@ -92,22 +93,22 @@
 use mmg_microbus::prelude::*;
 
 #[derive(Clone, Debug)] struct Tick(pub u64);
-#[derive(Clone, Debug, Default)] struct Cfg { n: u64 }
 
 #[mmg_microbus::component]
 #[derive(Default)]
-struct AppComp { cfg: Option<Cfg> }
+struct AppComp { counter: std::sync::atomic::AtomicU64 }
 
 #[mmg_microbus::component]
 impl AppComp {
   #[mmg_microbus::init]
-  async fn init(&mut self, _ctx: &mmg_microbus::component::ComponentContext, cfg: &Cfg) {
-    self.cfg = Some(cfg.clone());
+  async fn init(&self, _ctx: &mmg_microbus::component::ComponentContext) {
+    // 自行初始化内部状态，这里无需外部配置
   }
 
   #[mmg_microbus::active] // 无限循环
-  async fn tick(&mut self, _ctx: &mmg_microbus::component::ComponentContext) -> Option<Tick> {
-    Some(Tick(self.cfg.as_ref().map(|c| c.n).unwrap_or(0)))
+  async fn tick(&self, _ctx: &mmg_microbus::component::ComponentContext) -> Option<Tick> {
+    let v = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Tick(v))
   }
 
   #[mmg_microbus::active(once)]
@@ -125,8 +126,6 @@ impl AppComp {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> mmg_microbus::error::Result<()> {
   let mut app = App::new(Default::default());
-  // 不再需要 add_component；组件单例自动发现
-  app.config(Cfg { n: 42 }).await?;
   app.start().await?;
   app.stop().await;
   Ok(())
@@ -134,9 +133,8 @@ async fn main() -> mmg_microbus::error::Result<()> {
 ```
 
 ## 诊断与常见错误
-- 启动报缺配置：某组件 `#[init]` 声明了 `&Cfg`，但未通过 `app.config(Cfg{..})` 注入。
 - 方法签名报错：`#[handle]` 必须为（可选 Context + 恰好一个 `&T`）；`#[active]` 不允许业务参数；最多一个 Context。
-- 收不到消息：确认组件已添加并完成 `start()`；确保消息类型匹配并存在生产方（主动函数返回或其他 handler 返回）。
+- 收不到消息：确认组件已添加并完成 `start()`；确保消息类型匹配并存在生产方（主动函数返回或其它 handler 返回）。
 
 ## 边界与非目标
 - 仅进程内（不含网络/IPC）。

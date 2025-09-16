@@ -5,10 +5,6 @@ struct Tick(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Price(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Cfg {
-    n: u64,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct Stopped(&'static str);
 
 #[mmg_microbus::component]
@@ -26,13 +22,14 @@ impl Producer {
 #[mmg_microbus::component]
 #[derive(Default)]
 struct Trader {
-    cfg: Option<Cfg>,
+    bias: u64,
 }
 #[mmg_microbus::component]
 impl Trader {
     #[mmg_microbus::init]
-    async fn init(&mut self, cfg: &Cfg) {
-        self.cfg = Some(cfg.clone());
+    async fn init(&mut self) {
+        // 自行初始化需要的状态（示例：固定偏移量）
+        self.bias = 1;
     }
     #[mmg_microbus::handle]
     async fn on_tick(
@@ -40,7 +37,7 @@ impl Trader {
         _ctx: &mmg_microbus::component::ComponentContext,
         t: &Tick,
     ) -> Option<Price> {
-        Some(Price(t.0 + self.cfg.as_ref().map(|c| c.n).unwrap_or(0)))
+        Some(Price(t.0 + self.bias))
     }
     #[mmg_microbus::stop]
     async fn on_stop(&self) -> Stopped {
@@ -65,7 +62,6 @@ impl Collector {
 #[tokio::test(flavor = "multi_thread")]
 async fn end_to_end_flow_and_stop() {
     let mut app = App::new(Default::default());
-    let _ = app.config(Cfg { n: 1 }).await.expect("config");
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     assert!(SEEN_PRICE.load(std::sync::atomic::Ordering::SeqCst) > 0);
