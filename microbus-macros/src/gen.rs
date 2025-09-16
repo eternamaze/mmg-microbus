@@ -22,16 +22,20 @@ pub(crate) fn component_entry(args: TokenStream, input: TokenStream) -> TokenStr
 fn component_for_struct(item: ItemStruct, _args: proc_macro2::TokenStream) -> TokenStream {
     let struct_ident = &item.ident;
     let factory_ident = format_ident!("__{}Factory", struct_ident);
-    let build_body = quote! { Ok(Box::new(<#struct_ident as Default>::default())) };
+    // 显式 Default 约束：若目标类型未实现 Default，这里生成的伪 trait 绑定会触发编译期错误，提供清晰信息。
+    let default_assert_ident = format_ident!("__AssertDefaultFor{}", struct_ident);
     let expanded = quote! {
         #item
+        // 编译期断言：类型必须实现 Default
+        #[allow(non_camel_case_types)]
+        trait #default_assert_ident { fn __assert_default() { let _ = <#struct_ident as Default>::default(); } }
         #[doc(hidden)]
         #[derive(Default)]
         struct #factory_ident;
         #[async_trait::async_trait]
         impl mmg_microbus::component::ComponentFactory for #factory_ident {
             fn type_name(&self) -> &'static str { std::any::type_name::<#struct_ident>() }
-            async fn build(&self, _bus: mmg_microbus::bus::BusHandle) -> mmg_microbus::error::Result<Box<dyn mmg_microbus::component::Component>> { #build_body }
+            async fn build(&self, _bus: mmg_microbus::bus::BusHandle) -> mmg_microbus::error::Result<Box<dyn mmg_microbus::component::Component>> { Ok(Box::new(<#struct_ident as Default>::default())) }
         }
         #[doc(hidden)]
         const _: () = {
@@ -232,10 +236,12 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
             }
             if has_handle_attr {
                 let mut wants_ctx = false;
+                let mut duplicate_ctx = false;
                 let mut candidates: Vec<(Option<Ident>, Type)> = Vec::new();
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(pat_ty) = arg {
                         if is_ctx_type(&pat_ty.ty) {
+                            if wants_ctx { duplicate_ctx = true; }
                             wants_ctx = true;
                             continue;
                         }
@@ -245,6 +251,7 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                         }
                     }
                 }
+                if duplicate_ctx { compile_errors.push(quote!{ compile_error!("#[handle] allows at most one &ComponentContext parameter") }); }
                 let chosen = if candidates.len() == 1 {
                     Some(candidates[0].1.clone())
                 } else if candidates.is_empty() {
@@ -284,18 +291,23 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                     }
                 }
                 let mut wants_ctx = false;
+                let mut duplicate_ctx = false;
                 let mut extra: Vec<Type> = Vec::new();
                 for arg in &m.sig.inputs {
                     match arg {
                         syn::FnArg::Receiver(_) => {}
                         syn::FnArg::Typed(p) => {
                             if is_ctx_type(&p.ty) {
+                                if wants_ctx { duplicate_ctx = true; }
                                 wants_ctx = true;
                             } else if let Some(t) = parse_msg_arg_ref(&p.ty) {
                                 extra.push(t);
                             }
                         }
                     }
+                }
+                if duplicate_ctx {
+                    return syn::Error::new_spanned(&m.sig, "#[active] allows at most one &ComponentContext parameter").to_compile_error().into();
                 }
                 if !extra.is_empty() {
                     return syn::Error::new_spanned(&m.sig, "#[active] method can only take &ComponentContext as parameter; other &T parameters are not allowed").to_compile_error().into();
@@ -334,53 +346,43 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
             }
             if has_init {
                 let mut wants_ctx = false;
-                let mut errors = Vec::new();
+                let mut invalid_extra = false;
                 for arg in &m.sig.inputs {
-                    if let syn::FnArg::Typed(pat_ty) = arg {
-                        if is_ctx_type(&pat_ty.ty) {
-                            wants_ctx = true;
-                        } else if parse_msg_arg_ref(&pat_ty.ty).is_some() {
-                            errors.push(syn::Error::new_spanned(&m.sig, "#[init] no longer supports &Cfg parameter; embed configuration logic internally").to_compile_error());
-                        } else {
-                            errors.push(
-                                syn::Error::new_spanned(
-                                    &m.sig,
-                                    "#[init] only allows optional &ComponentContext",
-                                )
-                                .to_compile_error(),
-                            );
+                    match arg {
+                        syn::FnArg::Receiver(_) => {},
+                        syn::FnArg::Typed(p) => {
+                            if is_ctx_type(&p.ty) {
+                                if wants_ctx { invalid_extra = true; } // 第二个 ctx 视为错误
+                                wants_ctx = true;
+                            } else {
+                                invalid_extra = true; // 非 ctx 参数
+                            }
                         }
                     }
                 }
-                if !errors.is_empty() {
-                    compile_errors.extend(errors);
-                }
-                inits.push(InitSpec {
-                    ident: m.sig.ident.clone(),
-                    wants_ctx,
-                    ret_case: analyze_return(&m.sig),
-                });
+                if invalid_extra { compile_errors.push(syn::Error::new_spanned(&m.sig, "#[init] only allows optional &ComponentContext").to_compile_error()); }
+                inits.push(InitSpec { ident: m.sig.ident.clone(), wants_ctx, ret_case: analyze_return(&m.sig) });
             }
             if has_stop {
                 let mut extraneous = Vec::new();
                 let mut wants_ctx = false;
+                let mut duplicate_ctx = false;
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(p) = arg {
                         if is_ctx_type(&p.ty) {
+                            if wants_ctx { duplicate_ctx = true; }
                             wants_ctx = true;
                         } else {
                             extraneous.push(p.ty.clone());
                         }
                     }
                 }
+                if duplicate_ctx { compile_errors.push(syn::Error::new_spanned(&m.sig, "#[stop] allows at most one &ComponentContext parameter").to_compile_error()); }
                 if !extraneous.is_empty() {
                     compile_errors.push(syn::Error::new_spanned(&m.sig, "#[stop] method must take only self or optionally &self plus &ComponentContext").to_compile_error());
-                } else {
-                    stops.push(StopSpec {
-                        ident: m.sig.ident.clone(),
-                        wants_ctx,
-                        ret_case: analyze_return(&m.sig),
-                    });
+                }
+                if !duplicate_ctx && extraneous.is_empty() {
+                    stops.push(StopSpec { ident: m.sig.ident.clone(), wants_ctx, ret_case: analyze_return(&m.sig) });
                 }
             }
         }
@@ -416,11 +418,7 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
     let mut init_calls = Vec::new();
     for i in &inits {
         let ident = &i.ident;
-        let call_core = if i.wants_ctx {
-            quote! { this.#ident(&ctx) }
-        } else {
-            quote! { this.#ident() }
-        };
+        let call_core = if i.wants_ctx { quote! { this.#ident(&ctx) } } else { quote! { this.#ident() } };
         let call_expr = gen_ret_case_tokens("init returned error", call_core, &i.ret_case);
         init_calls.push(quote! { { #call_expr } });
     }
