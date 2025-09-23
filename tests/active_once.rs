@@ -15,6 +15,7 @@ struct Booter;
 impl Booter {
     #[mmg_microbus::active(once)]
     async fn boot(&self) -> Boot {
+        tokio::task::yield_now().await;
         let n = ACTIVE_CALLS.fetch_add(1, Ordering::SeqCst);
         Boot(n)
     }
@@ -28,6 +29,7 @@ struct Collector;
 impl Collector {
     #[mmg_microbus::handle]
     async fn on_boot(&self, _ctx: &mmg_microbus::component::ComponentContext, b: &Boot) {
+        tokio::task::yield_now().await;
         // 只应收到一次，b.0 应为 0
         let _ = b.0;
         RECEIVED.fetch_add(1, Ordering::SeqCst);
@@ -36,7 +38,7 @@ impl Collector {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn active_once_executes_exactly_once() {
-    let mut app = App::new(Default::default());
+    let mut app = App::new(mmg_microbus::config::AppConfig::default());
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     app.stop().await;

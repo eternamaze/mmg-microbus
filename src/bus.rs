@@ -10,13 +10,19 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+// Small helper alias used across functions
+type SenderVec<T> = SmallVec<[mpsc::Sender<Arc<T>>; 8]>;
+
 // 类型级 fanout 路由（按消息类型广播，不做拓扑/主题分层）
 
 pub struct Subscription<T> {
     rx: mpsc::Receiver<Arc<T>>,
 }
 impl<T> Subscription<T> {
-    pub async fn recv(&mut self) -> Option<Arc<T>> {
+    pub async fn recv(&mut self) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
         self.rx.recv().await
     }
 }
@@ -56,6 +62,7 @@ pub struct Bus {
     handle: BusHandle,
 }
 impl Bus {
+    #[must_use]
     pub fn new(default_capacity: usize) -> Self {
         let inner = BusInner {
             subs: RwLock::new(HashMap::new()),
@@ -68,27 +75,32 @@ impl Bus {
             },
         }
     }
+    #[must_use]
     pub fn handle(&self) -> BusHandle {
         self.handle.clone()
     }
 }
 
 impl BusHandle {
-    pub(crate) async fn subscribe_type<T: Send + Sync + 'static>(&self) -> Subscription<T> {
+    pub(crate) fn subscribe_type<T: Send + Sync + 'static>(&self) -> Subscription<T> {
         if self.inner.sealed.load(Ordering::Acquire) {
             tracing::warn!("subscribe called after bus sealed (late task start); accepting for compatibility with startup race");
         }
-        let mut subs = self.inner.subs.write();
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
-        let entry = subs
-            .entry(type_id)
-            .or_insert_with(|| Box::new(TypeIndex::<T>::default()) as Box<dyn Any + Send + Sync>);
-        let (tx, rx) = mpsc::channel::<Arc<T>>(cap);
-        if let Some(idx) = entry.downcast_mut::<TypeIndex<T>>() {
-            idx.any.push(tx);
-        } else {
-            tracing::error!("type index downcast failed; subscription ignored");
+        let (tx_local, rx) = mpsc::channel::<Arc<T>>(cap);
+        {
+            let mut map = self.inner.subs.write();
+            let entry = map.entry(type_id).or_insert_with(|| {
+                Box::new(TypeIndex::<T>::default()) as Box<dyn Any + Send + Sync>
+            });
+            if let Some(idx) = (**entry).downcast_mut::<TypeIndex<T>>() {
+                idx.any.push(tx_local);
+            } else {
+                tracing::error!("type index downcast failed; subscription ignored");
+            }
+            // drop lock early
+            drop(map);
         }
         Subscription { rx }
     }
@@ -98,27 +110,30 @@ impl BusHandle {
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
         // 读取订阅快照（只读锁期间不执行 await）
-        type SenderVec<T> = SmallVec<[mpsc::Sender<Arc<T>>; 8]>;
         let (open_count, idx_any): (usize, Option<SenderVec<T>>) = {
             let subs = self.inner.subs.read();
-            if let Some(entry) = subs.get(&type_id) {
-                if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
-                    // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
-                    let mut opened: SenderVec<T> = SmallVec::new();
-                    for tx in idx.any.iter() {
-                        if !tx.is_closed() {
-                            opened.push(tx.clone());
-                        }
-                    }
-                    let c = opened.len();
-                    (c, Some(opened))
-                } else {
-                    tracing::error!("type mismatch in type index for this type");
-                    (0, None)
-                }
-            } else {
-                (0, None)
-            }
+            subs.get(&type_id).map_or_else(
+                || (0, None),
+                |entry| {
+                    (**entry).downcast_ref::<TypeIndex<T>>().map_or_else(
+                        || {
+                            tracing::error!("type mismatch in type index for this type");
+                            (0, None)
+                        },
+                        |idx| {
+                            // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
+                            let mut opened: SenderVec<T> = SmallVec::new();
+                            for tx in &idx.any {
+                                if !tx.is_closed() {
+                                    opened.push(tx.clone());
+                                }
+                            }
+                            let c = opened.len();
+                            (c, Some(opened))
+                        },
+                    )
+                },
+            )
         };
         if open_count == 0 {
             return;
@@ -130,21 +145,19 @@ impl BusHandle {
         if open_count == 1 {
             let tx = &senders[0];
             match tx.try_send(arc.clone()) {
-                Ok(()) => return,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     let _ = tx.send(arc).await;
                     return;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
             }
         }
         // 多订阅者：先 try_send，满的收集到 pending 再顺序 await（最后一次复用 arc）
         let mut pending: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-        for tx in senders.iter() {
+        for tx in &senders {
             match tx.try_send(arc.clone()) {
-                Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending.push(tx.clone()),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
         if !pending.is_empty() {
@@ -158,15 +171,13 @@ impl BusHandle {
     // 发布接口：仅供宏生成代码内部使用
 
     #[cfg(test)]
-    pub async fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
+    #[must_use]
+    pub fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
         let type_id = TypeId::of::<T>();
         let subs = self.inner.subs.read();
-        if let Some(entry) = subs.get(&type_id) {
-            if let Some(idx) = entry.downcast_ref::<TypeIndex<T>>() {
-                return idx.any.iter().filter(|tx| !tx.is_closed()).count();
-            }
-        }
-        0
+        subs.get(&type_id)
+            .and_then(|entry| (**entry).downcast_ref::<TypeIndex<T>>())
+            .map_or(0, |idx| idx.any.iter().filter(|tx| !tx.is_closed()).count())
     }
 }
 

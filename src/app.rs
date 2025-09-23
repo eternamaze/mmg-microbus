@@ -20,6 +20,7 @@ pub struct App {
 }
 
 impl App {
+    #[must_use]
     pub fn new(cfg: AppConfig) -> Self {
         let bus = Bus::new(cfg.queue_capacity);
         let stop_flag = __new_stop_flag();
@@ -34,6 +35,13 @@ impl App {
     }
 
     // 框架配置仅能在 new() 时提供；运行期不支持修改。
+    /// 启动并运行所有通过 inventory 注册的组件。
+    ///
+    /// # Errors
+    /// 当任一组件构建或初始化失败时返回错误，并触发整个应用停机。
+    ///
+    /// # Panics
+    /// 内部依赖的启动屏障未正确设置时可能触发 panic（仅限编程错误场景）。
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
             return Ok(());
@@ -45,7 +53,7 @@ impl App {
         let total = factories.len();
         let startup_barrier = __new_startup_barrier(total);
         self.startup_barrier = Some(startup_barrier.clone());
-        for reg in factories.into_iter() {
+        for reg in factories {
             let factory = (reg.create)();
             let name = factory.type_name().to_string();
             let stop_clone = self.stop_flag.clone();
@@ -94,16 +102,18 @@ impl App {
         // 2) 强制结束所有组件任务（无需等待其“自然退出”）。
         let mut rest = Vec::new();
         rest.append(&mut self.tasks);
-        for h in rest.into_iter() {
+        for h in rest {
             // 组件 run() 应该在收到停止后尽快返回；这里直接等待一次 join，若 panic/取消也忽略。
             let _ = h.await;
         }
         self.started = false;
     }
+    #[must_use]
     pub fn bus_handle(&self) -> BusHandle {
         self.bus.handle()
     }
-    pub fn is_started(&self) -> bool {
+    #[must_use]
+    pub const fn is_started(&self) -> bool {
         self.started
     }
 }

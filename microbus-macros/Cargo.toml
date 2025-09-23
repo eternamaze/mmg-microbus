@@ -2,6 +2,12 @@
 name = "microbus-macros"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Procedural macros for mmg-microbus: #[component], #[handle], #[active], #[init], #[stop]"
+repository = "https://github.com/eternamaze/mmg-microbus"
+readme = "README.md"
+keywords = ["proc-macro", "bus", "async", "tokio"]
+categories = ["development-tools::procedural-macro-helpers", "asynchronous"]
 
 [lib]
 proc-macro = true

@@ -62,10 +62,11 @@ pub struct ComponentContext {
 
 impl ComponentContext {
     // 组件标识符仅供运行期内部使用；不对业务暴露寻址能力
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn new_with_service(
+    pub const fn new_with_service(
         name: String,
         bus: BusHandle,
         stop: Arc<StopFlag>,
@@ -103,7 +104,7 @@ impl ComponentContext {
 pub struct AutoSubscription<T> {
     inner: crate::bus::Subscription<T>,
 }
-impl<T> AutoSubscription<T> {
+impl<T: Send + Sync + 'static> AutoSubscription<T> {
     pub async fn recv(&mut self) -> Option<std::sync::Arc<T>> {
         self.inner.recv().await
     }
@@ -114,10 +115,11 @@ impl<T> AutoSubscription<T> {
 // 内部宏辅助 API（不对业务暴露）
 // 订阅：仅类型级（任意来源）
 
-pub async fn __subscribe_any_auto<T: Send + Sync + 'static>(
+#[must_use]
+pub fn __subscribe_any_auto<T: Send + Sync + 'static>(
     ctx: &ComponentContext,
 ) -> AutoSubscription<T> {
-    let sub = ctx.bus.subscribe_type::<T>().await;
+    let sub = ctx.bus.subscribe_type::<T>();
     AutoSubscription { inner: sub }
 }
 
@@ -128,7 +130,7 @@ pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, ms
 
 // 配置相关能力已移除：init 仅由组件自身内部逻辑决定，其它注入路径删除。
 
-/// 内部停止信号（仅供宏生成的 run() 使用）
+/// 内部停止信号（仅供宏生成的 `run()` 使用）
 pub async fn __recv_stop(ctx: &ComponentContext) {
     if ctx.stop.is_set() {
         return;
@@ -156,6 +158,7 @@ pub struct StartupBarrier {
     failed: AtomicBool,
 }
 impl StartupBarrier {
+    #[must_use]
     pub fn new(total: usize) -> Self {
         Self {
             total,

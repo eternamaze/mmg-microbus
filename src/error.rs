@@ -10,8 +10,8 @@ pub enum MicrobusError {
 impl fmt::Display for MicrobusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MicrobusError::Other(msg) => write!(f, "{msg}"),
-            MicrobusError::Dynamic(s) => write!(f, "{s}"),
+            Self::Other(msg) => write!(f, "{msg}"),
+            Self::Dynamic(s) => write!(f, "{s}"),
         }
     }
 }
