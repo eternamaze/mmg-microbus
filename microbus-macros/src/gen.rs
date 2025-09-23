@@ -26,8 +26,7 @@ fn component_for_struct(item: ItemStruct, _args: proc_macro2::TokenStream) -> To
     let default_assert_ident = format_ident!("__AssertDefaultFor{}", struct_ident);
     let expanded = quote! {
         #item
-        // 编译期断言：类型必须实现 Default
-        #[allow(non_camel_case_types)]
+    // 编译期断言：类型必须实现 Default
         trait #default_assert_ident { fn __assert_default() { let _ = <#struct_ident as Default>::default(); } }
         #[doc(hidden)]
         #[derive(Default)]
@@ -472,7 +471,6 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
     }
 
     let gen_run = quote! {
-        #[allow(unreachable_code)]
         #[async_trait::async_trait]
         impl mmg_microbus::component::Component for #self_ty {
             async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> mmg_microbus::error::Result<()> {
