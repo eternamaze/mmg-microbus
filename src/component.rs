@@ -54,7 +54,7 @@ impl StopFlag {
 }
 
 pub struct ComponentContext {
-    name: String,
+    name: Arc<str>,
     bus: BusHandle,
     stop: Arc<StopFlag>,
     startup: Arc<StartupBarrier>,
@@ -66,14 +66,14 @@ impl ComponentContext {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub const fn new_with_service(
+    pub fn new_with_service(
         name: String,
         bus: BusHandle,
         stop: Arc<StopFlag>,
         startup: Arc<StartupBarrier>,
     ) -> Self {
         Self {
-            name,
+            name: Arc::<str>::from(name),
             bus,
             stop,
             startup,
@@ -88,7 +88,8 @@ impl ComponentContext {
     // 配置不支持热更新：仅在启动时注入一次
 
     #[doc(hidden)]
-    pub(crate) fn __fork(&self) -> Self {
+    #[must_use]
+    pub fn __fork(&self) -> Self {
         Self {
             name: self.name.clone(),
             bus: self.bus.clone(),

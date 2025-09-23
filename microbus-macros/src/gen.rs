@@ -205,34 +205,35 @@ fn gen_ret_case_tokens(
     call_core: &proc_macro2::TokenStream,
     rc: &RetCase,
     abort_on_error: bool,
+    ctx_ident: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     match rc {
         RetCase::Unit => quote! { let _ = #call_core.await; },
         RetCase::ResultUnit => {
             if abort_on_error {
-                quote! { if let Err(e)=#call_core.await { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&ctx); return Err(e); } }
+                quote! { if let Err(e)=#call_core.await { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&#ctx_ident); return Err(e); } }
             } else {
                 quote! { if let Err(e)=#call_core.await { tracing::warn!(error=?e, #phase); } }
             }
         }
         RetCase::Some => {
-            quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
+            quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&#ctx_ident, __v).await; } }
         }
         RetCase::OptionSome => {
-            quote! { { if let Some(__v)=#call_core.await { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
+            quote! { { if let Some(__v)=#call_core.await { mmg_microbus::component::__publish_auto(&#ctx_ident, __v).await; } } }
         }
         RetCase::ResultSome => {
             if abort_on_error {
-                quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e)=> { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&ctx); return Err(e); } } }
+                quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&#ctx_ident, v).await, Err(e)=> { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&#ctx_ident); return Err(e); } } }
             } else {
-                quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e)=> { tracing::warn!(error=?e, #phase); } } }
+                quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&#ctx_ident, v).await, Err(e)=> { tracing::warn!(error=?e, #phase); } } }
             }
         }
         RetCase::ResultOption => {
             if abort_on_error {
-                quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e)=> { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&ctx); return Err(e); } } }
+                quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&#ctx_ident, v).await }, Err(e)=> { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&#ctx_ident); return Err(e); } } }
             } else {
-                quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e)=> { tracing::warn!(error=?e, #phase); } } }
+                quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&#ctx_ident, v).await }, Err(e)=> { tracing::warn!(error=?e, #phase); } } }
             }
         }
     }
@@ -265,6 +266,12 @@ fn collect_handles(item: &ItemImpl) -> (Vec<MethodSpec>, Vec<proc_macro2::TokenS
                 errs.push(quote! { compile_error!("a method can only have one #[handle(...)] attribute"); });
             }
             if has_handle_attr {
+                if let Some(rcv) = m.sig.receiver() {
+                    if rcv.mutability.is_some() {
+                        errs.push(syn::Error::new_spanned(&m.sig, "#[handle] method cannot take &mut self under spawned worker model; use interior mutability").to_compile_error());
+                        continue;
+                    }
+                }
                 let mut wants_ctx = false;
                 let mut duplicate_ctx = false;
                 let mut candidates: Vec<(Option<Ident>, Type)> = Vec::new();
@@ -437,6 +444,18 @@ fn collect_inits_stops(
                 let mut extraneous = Vec::new();
                 let mut wants_ctx = false;
                 let mut duplicate_ctx = false;
+                if let Some(rcv) = m.sig.receiver() {
+                    if rcv.mutability.is_some() {
+                        compile_errors.push(
+                            syn::Error::new_spanned(
+                                &m.sig,
+                                "#[stop] cannot take &mut self; use interior mutability",
+                            )
+                            .to_compile_error(),
+                        );
+                        continue;
+                    }
+                }
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(p) = arg {
                         if is_ctx_type(&p.ty) {
@@ -486,7 +505,13 @@ fn build_init_stop_calls(
         } else {
             quote! { this.#ident() }
         };
-        let call_expr = gen_ret_case_tokens("init returned error", &call_core, &i.ret_case, true);
+        let call_expr = gen_ret_case_tokens(
+            "init returned error",
+            &call_core,
+            &i.ret_case,
+            true,
+            &quote! {ctx},
+        );
         init_calls.push(quote! { { #call_expr } });
     }
     let mut stop_calls = Vec::new();
@@ -497,7 +522,13 @@ fn build_init_stop_calls(
         } else {
             quote! { this.#ident() }
         };
-        let call_expr = gen_ret_case_tokens("stop returned error", &call_core, &s.ret_case, false);
+        let call_expr = gen_ret_case_tokens(
+            "stop returned error",
+            &call_core,
+            &s.ret_case,
+            false,
+            &quote! {ctx},
+        );
         stop_calls.push(quote! { { #call_expr } });
     }
     (init_calls, stop_calls)
@@ -507,8 +538,8 @@ struct RunParts {
     init_calls: Vec<proc_macro2::TokenStream>,
     stop_calls: Vec<proc_macro2::TokenStream>,
     sub_decls: Vec<proc_macro2::TokenStream>,
-    select_arms: Vec<proc_macro2::TokenStream>,
-    active_arms: Vec<proc_macro2::TokenStream>,
+    handle_spawns: Vec<proc_macro2::TokenStream>,
+    active_spawns: Vec<proc_macro2::TokenStream>,
     once_calls: Vec<proc_macro2::TokenStream>,
     compile_errors: Vec<proc_macro2::TokenStream>,
 }
@@ -517,8 +548,8 @@ fn gen_component_run(self_ty: &syn::Type, parts: &RunParts, item: &ItemImpl) -> 
     let init_calls = &parts.init_calls;
     let stop_calls = &parts.stop_calls;
     let sub_decls = &parts.sub_decls;
-    let select_arms = &parts.select_arms;
-    let active_arms = &parts.active_arms;
+    let handle_spawns = &parts.handle_spawns;
+    let active_spawns = &parts.active_spawns;
     let once_calls = &parts.once_calls;
     let gen_run = quote! {
         #[async_trait::async_trait]
@@ -526,11 +557,17 @@ fn gen_component_run(self_ty: &syn::Type, parts: &RunParts, item: &ItemImpl) -> 
             async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> mmg_microbus::error::Result<()> {
                 let mut this = *self;
                 #( #init_calls )*
+                let this = std::sync::Arc::new(this);
                 #( #sub_decls )*
                 mmg_microbus::component::__startup_arrive_and_wait(&ctx).await;
                 { #( #once_calls )* }
-                tokio::task::yield_now().await;
-                loop { tokio::select! { #( #select_arms )* #( #active_arms )* _ = mmg_microbus::component::__recv_stop(&ctx) => { break; } } }
+                let mut __workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                #( #handle_spawns )*
+                #( #active_spawns )*
+                // 等待停止信号
+                mmg_microbus::component::__recv_stop(&ctx).await;
+                // 等待子任务退出
+                for h in __workers { let _ = h.await; }
                 #( #stop_calls )*
                 Ok(())
             }
@@ -555,44 +592,98 @@ fn generate_run_impl_inner(item: &ItemImpl, self_ty: &syn::Type) -> TokenStream 
     let (init_calls, stop_calls) = build_init_stop_calls(&inits, &stops);
     // build select arms and active arms, also get once_calls
     let mut sub_decls = Vec::new();
-    let mut select_arms = Vec::new();
-    let mut active_arms = Vec::new();
+    let mut handle_spawns = Vec::new();
+    let mut active_spawns = Vec::new();
     let mut once_calls = Vec::new();
     for (idx, ms) in methods.iter().enumerate() {
         let ty = &ms.msg_ty;
         let method_ident = &ms.ident;
         let sub_var = format_ident!("__sub_any_{}", idx);
         sub_decls.push(quote! { let mut #sub_var = mmg_microbus::component::__subscribe_any_auto::<#ty>(&ctx); });
-        let call_core = if ms.wants_ctx {
-            quote! { this.#method_ident(&ctx, &*env) }
+        let call_core_spawn = if ms.wants_ctx {
+            quote! { this.#method_ident(&ctx_c, &*env) }
         } else {
             quote! { this.#method_ident(&*env) }
         };
-        let call_expr =
-            gen_ret_case_tokens("handle returned error", &call_core, &ms.ret_case, false);
-        select_arms.push(quote! { msg = #sub_var.recv() => { match msg { Some(env) => { { #call_expr } } None => { break; } } } });
+        let call_expr_spawn = gen_ret_case_tokens(
+            "handle returned error",
+            &call_core_spawn,
+            &ms.ret_case,
+            false,
+            &quote! {ctx_c},
+        );
+        // 为每个 handle 启动一个 worker 任务（单实例），在屏障之后 spawn，并监听 stop 信号
+        handle_spawns.push(quote! {
+            let this_c = this.clone();
+            let ctx_c = ctx.__fork();
+            let mut sub = #sub_var; // 移动进入任务
+            let __jh = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = mmg_microbus::component::__recv_stop(&ctx_c) => { break; }
+                        msg = sub.recv() => {
+                            match msg {
+                                Some(env) => { let this = &this_c; { #call_expr_spawn } }
+                                None => { break; }
+                            }
+                        }
+                    }
+                }
+            });
+            __workers.push(__jh);
+        });
     }
     for a in &actives {
         let method_ident = &a.ident;
-        let call_core = if a.wants_ctx {
+        let call_core_once = if a.wants_ctx {
             quote! { this.#method_ident(&ctx) }
         } else {
             quote! { this.#method_ident() }
         };
-        let call_expr =
-            gen_ret_case_tokens("active returned error", &call_core, &a.ret_case, false);
+        let call_expr_once = gen_ret_case_tokens(
+            "active returned error",
+            &call_core_once,
+            &a.ret_case,
+            false,
+            &quote! {ctx},
+        );
         if a.kind == ActiveKind::Once {
-            once_calls.push(call_expr);
+            once_calls.push(call_expr_once);
         } else {
-            active_arms.push(quote! { _ = async {} => { #call_expr } });
+            let call_core_spawn = if a.wants_ctx {
+                quote! { this.#method_ident(&ctx_c) }
+            } else {
+                quote! { this.#method_ident() }
+            };
+            let call_expr_spawn = gen_ret_case_tokens(
+                "active returned error",
+                &call_core_spawn,
+                &a.ret_case,
+                false,
+                &quote! {ctx_c},
+            );
+            // 为每个循环型 active 启动一个 worker（单实例循环），在屏障之后 spawn，并监听 stop 信号
+            active_spawns.push(quote! {
+                let this_c = this.clone();
+                let ctx_c = ctx.__fork();
+                let __jh = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = mmg_microbus::component::__recv_stop(&ctx_c) => { break; }
+                            _ = async { let this = &this_c; { #call_expr_spawn } } => {}
+                        }
+                    }
+                });
+                __workers.push(__jh);
+            });
         }
     }
     let parts = RunParts {
         init_calls,
         stop_calls,
         sub_decls,
-        select_arms,
-        active_arms,
+        handle_spawns,
+        active_spawns,
         once_calls,
         compile_errors,
     };

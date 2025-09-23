@@ -27,14 +27,40 @@ impl<T> Subscription<T> {
     }
 }
 
-// 订阅索引：仅类型级；启动完成后不再增删（冻结）
+// 订阅索引：类型级。
+// - 启动阶段（未封印）：累积订阅到 `any`。
+// - 封印后：惰性构建不可变快照 `frozen_any`，发布阶段直接使用该快照，避免每次发布克隆 sender 与小分配。
 struct TypeIndex<T: Send + Sync + 'static> {
     any: SmallVec<[mpsc::Sender<Arc<T>>; 4]>,
+    frozen_any: Option<std::sync::Arc<[mpsc::Sender<Arc<T>>]>>,
 }
 impl<T: Send + Sync + 'static> Default for TypeIndex<T> {
     fn default() -> Self {
         Self {
             any: SmallVec::new(),
+            frozen_any: None,
+        }
+    }
+}
+
+// 类型擦除条目：允许在 seal() 时统一冻结，而在泛型路径下仍可做具体类型的 downcast。
+trait TypeIndexEntry: Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn freeze(&mut self);
+}
+impl<T: Send + Sync + 'static> TypeIndexEntry for TypeIndex<T> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn freeze(&mut self) {
+        if self.frozen_any.is_none() {
+            let small = std::mem::take(&mut self.any);
+            let vec = small.into_vec();
+            self.frozen_any = Some(Arc::<[mpsc::Sender<Arc<T>>]>::from(vec));
         }
     }
 }
@@ -45,7 +71,7 @@ pub struct BusHandle {
 }
 
 struct BusInner {
-    subs: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    subs: RwLock<HashMap<TypeId, Box<dyn TypeIndexEntry>>>,
     default_capacity: usize,
     sealed: AtomicBool, // 一旦置 true，订阅结构视为只读
 }
@@ -83,18 +109,19 @@ impl Bus {
 
 impl BusHandle {
     pub(crate) fn subscribe_type<T: Send + Sync + 'static>(&self) -> Subscription<T> {
-        if self.inner.sealed.load(Ordering::Acquire) {
-            tracing::warn!("subscribe called after bus sealed (late task start); accepting for compatibility with startup race");
-        }
+        assert!(
+            !self.inner.sealed.load(Ordering::Acquire),
+            "subscribe_type called after bus sealed: subscription graph is immutable after startup"
+        );
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
         let (tx_local, rx) = mpsc::channel::<Arc<T>>(cap);
         {
             let mut map = self.inner.subs.write();
-            let entry = map.entry(type_id).or_insert_with(|| {
-                Box::new(TypeIndex::<T>::default()) as Box<dyn Any + Send + Sync>
-            });
-            if let Some(idx) = (**entry).downcast_mut::<TypeIndex<T>>() {
+            let entry = map
+                .entry(type_id)
+                .or_insert_with(|| Box::<TypeIndex<T>>::default() as Box<dyn TypeIndexEntry>);
+            if let Some(idx) = entry.as_any_mut().downcast_mut::<TypeIndex<T>>() {
                 idx.any.push(tx_local);
             } else {
                 tracing::error!("type index downcast failed; subscription ignored");
@@ -109,19 +136,60 @@ impl BusHandle {
         // 顺序语义：同一类型的消息进入每个订阅者通道的顺序=各 publish 调用实际完成入队的顺序；无全局跨组件开播时间排序保证。
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
-        // 读取订阅快照（只读锁期间不执行 await）
+        if self.inner.sealed.load(Ordering::Acquire) {
+            self.publish_type_sealed::<T>(type_id, arc).await;
+        } else {
+            self.publish_type_unsealed::<T>(type_id, arc).await;
+        }
+    }
+
+    async fn publish_type_sealed<T: Send + Sync + 'static>(&self, type_id: TypeId, arc: Arc<T>) {
+        let frozen: Option<Arc<[mpsc::Sender<Arc<T>>]>> = {
+            let subs = self.inner.subs.read();
+            subs.get(&type_id)
+                .and_then(|entry| entry.as_any().downcast_ref::<TypeIndex<T>>())
+                .and_then(|idx| idx.frozen_any.clone())
+        };
+        if let Some(frozen) = frozen {
+            if frozen.len() == 1 {
+                let tx = &frozen[0];
+                match tx.try_send(arc.clone()) {
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        let _ = tx.send(arc).await;
+                    }
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+                return;
+            }
+            let mut pending_idx: SmallVec<[usize; 8]> = SmallVec::new();
+            for (i, tx) in frozen.iter().enumerate() {
+                match tx.try_send(arc.clone()) {
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending_idx.push(i),
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
+            if !pending_idx.is_empty() {
+                let last = pending_idx.len() - 1;
+                for &i in &pending_idx[..last] {
+                    let _ = frozen[i].send(arc.clone()).await;
+                }
+                let _ = frozen[pending_idx[last]].send(arc).await;
+            }
+        }
+    }
+
+    async fn publish_type_unsealed<T: Send + Sync + 'static>(&self, type_id: TypeId, arc: Arc<T>) {
         let (open_count, idx_any): (usize, Option<SenderVec<T>>) = {
             let subs = self.inner.subs.read();
             subs.get(&type_id).map_or_else(
                 || (0, None),
                 |entry| {
-                    (**entry).downcast_ref::<TypeIndex<T>>().map_or_else(
+                    entry.as_any().downcast_ref::<TypeIndex<T>>().map_or_else(
                         || {
                             tracing::error!("type mismatch in type index for this type");
                             (0, None)
                         },
                         |idx| {
-                            // 单次遍历统计并复制打开的发送端；通常订阅者很少，SmallVec 足够
                             let mut opened: SenderVec<T> = SmallVec::new();
                             for tx in &idx.any {
                                 if !tx.is_closed() {
@@ -138,7 +206,6 @@ impl BusHandle {
         if open_count == 0 {
             return;
         }
-        // 单订阅者快路径
         let Some(senders) = idx_any else {
             return;
         };
@@ -152,7 +219,6 @@ impl BusHandle {
                 Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
             }
         }
-        // 多订阅者：先 try_send，满的收集到 pending 再顺序 await（最后一次复用 arc）
         let mut pending: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
         for tx in &senders {
             match tx.try_send(arc.clone()) {
@@ -176,13 +242,19 @@ impl BusHandle {
         let type_id = TypeId::of::<T>();
         let subs = self.inner.subs.read();
         subs.get(&type_id)
-            .and_then(|entry| (**entry).downcast_ref::<TypeIndex<T>>())
+            .and_then(|entry| entry.as_any().downcast_ref::<TypeIndex<T>>())
             .map_or(0, |idx| idx.any.iter().filter(|tx| !tx.is_closed()).count())
     }
 }
 
 impl BusHandle {
     pub(crate) fn seal(&self) {
+        // 在封印前冻结所有已知类型的订阅快照，确保运行期发布路径无需惰性构建。
+        let mut subs = self.inner.subs.write();
+        for (_, entry) in subs.iter_mut() {
+            entry.freeze();
+        }
+        drop(subs);
         self.inner.sealed.store(true, Ordering::Release);
     }
 }
@@ -194,3 +266,67 @@ impl BusHandle {
 // 实现保持最小化（无内部指标采集）
 
 // 内部单元测试省略：由集成测试覆盖
+
+#[cfg(test)]
+mod perf_tests {
+    use std::time::Instant;
+    use tokio::task::JoinSet;
+
+    #[derive(Debug)]
+    struct Msg(u64);
+
+    async fn run_once(n_subs: usize, msgs: u64) -> u128 {
+        let bus = crate::bus::Bus::new(4096);
+        let handle = bus.handle();
+
+        // 订阅者：每个订阅者消费 msgs 条消息
+        let mut join = JoinSet::new();
+        for _ in 0..n_subs {
+            let mut sub = handle.subscribe_type::<Msg>();
+            join.spawn(async move {
+                let mut c = 0u64;
+                while c < msgs {
+                    match sub.recv().await {
+                        Some(msg) => {
+                            // 读取字段并通过 black_box 防止被优化掉
+                            std::hint::black_box(msg.0);
+                            c += 1;
+                        }
+                        None => break,
+                    }
+                }
+                c
+            });
+        }
+
+        // 封印后进入发布快路径
+        handle.seal();
+
+        let start = Instant::now();
+        for i in 0..msgs {
+            handle.publish_type(Msg(i)).await;
+        }
+        // 等全部订阅者完成
+        let mut total = 0u64;
+        while let Some(res) = join.join_next().await {
+            total += res.expect("task join");
+        }
+        assert_eq!(total, msgs * n_subs as u64);
+        start.elapsed().as_micros()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perf_publish_sealed() {
+        // 多组订阅者规模下的粗略性能采样
+        let msgs = 20_000u64;
+        for &subs in &[1usize, 4, 8] {
+            let us = run_once(subs, msgs).await;
+            let total_msgs = msgs * subs as u64;
+            // 以整数进行每秒吞吐计算，避免浮点精度丢失
+            let mps: u128 = (u128::from(total_msgs) * 1_000_000u128) / us;
+            eprintln!(
+                "sealed publish: subs={subs} msgs={msgs} elapsed={us}us throughput={mps} msg/s"
+            );
+        }
+    }
+}

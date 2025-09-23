@@ -10,7 +10,7 @@ struct C;
 #[mmg_microbus::component]
 impl C {
     #[mmg_microbus::handle]
-    async fn on_tick(&mut self, _ctx: &mmg_microbus::component::ComponentContext, _tick: &Tick) -> Result<()> { Ok(()) }
+    async fn on_tick(&self, _ctx: &mmg_microbus::component::ComponentContext, _tick: &Tick) -> Result<()> { Ok(()) }
 }
 
 fn main() {}
