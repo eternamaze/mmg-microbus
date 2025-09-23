@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{MicrobusError, Result};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -16,6 +16,7 @@ pub struct App {
     tasks: Vec<JoinHandle<()>>,
     started: bool,
     stop_flag: std::sync::Arc<crate::component::StopFlag>,
+    startup_barrier: Option<std::sync::Arc<crate::component::StartupBarrier>>, // 协调启动失败与等待
 }
 
 impl App {
@@ -28,6 +29,7 @@ impl App {
             tasks: Vec::new(),
             started: false,
             stop_flag,
+            startup_barrier: None,
         }
     }
 
@@ -42,6 +44,7 @@ impl App {
             inventory::iter::<__RegisteredFactory>.into_iter().collect();
         let total = factories.len();
         let startup_barrier = __new_startup_barrier(total);
+        self.startup_barrier = Some(startup_barrier.clone());
         for reg in factories.into_iter() {
             let factory = (reg.create)();
             let name = factory.type_name().to_string();
@@ -63,17 +66,24 @@ impl App {
                     }
                     Err(e) => {
                         tracing::error!(component = %name, kind = %factory.type_name(), error = %e, "failed to build component");
+                        // 构建失败视为启动失败
+                        crate::component::__startup_mark_failed_barrier(&barrier_clone);
                     }
                 }
             };
             let h = tokio::spawn(fut);
             self.tasks.push(h);
         }
-        // 让出多次调度，尽力确保所有组件进入 run() 并完成各自订阅
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        // 等待所有组件到达启动屏障或有失败发生
+        crate::component::__startup_wait_all(self.startup_barrier.as_ref().unwrap()).await;
         // 冻结 bus：后续不再期望新增订阅
         self.bus.handle().seal();
+        // 若启动阶段存在失败，触发停机并返回错误
+        if crate::component::__startup_failed(self.startup_barrier.as_ref().unwrap()) {
+            self.stop().await;
+            self.started = false;
+            return Err(MicrobusError::Other("app start aborted: init/build failed"));
+        }
         self.started = true;
         Ok(())
     }

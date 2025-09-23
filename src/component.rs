@@ -153,6 +153,7 @@ pub struct StartupBarrier {
     total: usize,
     arrived: AtomicUsize,
     notify: Notify,
+    failed: AtomicBool,
 }
 impl StartupBarrier {
     pub fn new(total: usize) -> Self {
@@ -160,6 +161,7 @@ impl StartupBarrier {
             total,
             arrived: AtomicUsize::new(0),
             notify: Notify::new(),
+            failed: AtomicBool::new(false),
         }
     }
     async fn arrive_and_wait(&self) {
@@ -170,7 +172,27 @@ impl StartupBarrier {
         }
         // 等待所有组件到达
         loop {
-            if self.arrived.load(Ordering::Acquire) >= self.total {
+            if self.arrived.load(Ordering::Acquire) >= self.total
+                || self.failed.load(Ordering::Acquire)
+            {
+                break;
+            }
+            self.notify.notified().await;
+        }
+    }
+    pub fn mark_failed(&self) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+    pub async fn wait_all(&self) {
+        loop {
+            if self.arrived.load(Ordering::Acquire) >= self.total
+                || self.failed.load(Ordering::Acquire)
+            {
                 break;
             }
             self.notify.notified().await;
@@ -183,4 +205,17 @@ pub(crate) fn __new_startup_barrier(total: usize) -> Arc<StartupBarrier> {
 }
 pub async fn __startup_arrive_and_wait(ctx: &ComponentContext) {
     ctx.startup.arrive_and_wait().await;
+}
+
+pub fn __startup_mark_failed(ctx: &ComponentContext) {
+    ctx.startup.mark_failed();
+}
+pub fn __startup_mark_failed_barrier(b: &Arc<StartupBarrier>) {
+    b.mark_failed();
+}
+pub async fn __startup_wait_all(b: &Arc<StartupBarrier>) {
+    b.wait_all().await;
+}
+pub fn __startup_failed(b: &Arc<StartupBarrier>) -> bool {
+    b.is_failed()
 }

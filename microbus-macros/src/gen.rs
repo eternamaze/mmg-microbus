@@ -240,7 +240,9 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(pat_ty) = arg {
                         if is_ctx_type(&pat_ty.ty) {
-                            if wants_ctx { duplicate_ctx = true; }
+                            if wants_ctx {
+                                duplicate_ctx = true;
+                            }
                             wants_ctx = true;
                             continue;
                         }
@@ -250,7 +252,9 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                         }
                     }
                 }
-                if duplicate_ctx { compile_errors.push(quote!{ compile_error!("#[handle] allows at most one &ComponentContext parameter") }); }
+                if duplicate_ctx {
+                    compile_errors.push(quote!{ compile_error!("#[handle] allows at most one &ComponentContext parameter") });
+                }
                 let chosen = if candidates.len() == 1 {
                     Some(candidates[0].1.clone())
                 } else if candidates.is_empty() {
@@ -297,7 +301,9 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                         syn::FnArg::Receiver(_) => {}
                         syn::FnArg::Typed(p) => {
                             if is_ctx_type(&p.ty) {
-                                if wants_ctx { duplicate_ctx = true; }
+                                if wants_ctx {
+                                    duplicate_ctx = true;
+                                }
                                 wants_ctx = true;
                             } else if let Some(t) = parse_msg_arg_ref(&p.ty) {
                                 extra.push(t);
@@ -306,7 +312,12 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                     }
                 }
                 if duplicate_ctx {
-                    return syn::Error::new_spanned(&m.sig, "#[active] allows at most one &ComponentContext parameter").to_compile_error().into();
+                    return syn::Error::new_spanned(
+                        &m.sig,
+                        "#[active] allows at most one &ComponentContext parameter",
+                    )
+                    .to_compile_error()
+                    .into();
                 }
                 if !extra.is_empty() {
                     return syn::Error::new_spanned(&m.sig, "#[active] method can only take &ComponentContext as parameter; other &T parameters are not allowed").to_compile_error().into();
@@ -348,10 +359,12 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                 let mut invalid_extra = false;
                 for arg in &m.sig.inputs {
                     match arg {
-                        syn::FnArg::Receiver(_) => {},
+                        syn::FnArg::Receiver(_) => {}
                         syn::FnArg::Typed(p) => {
                             if is_ctx_type(&p.ty) {
-                                if wants_ctx { invalid_extra = true; } // 第二个 ctx 视为错误
+                                if wants_ctx {
+                                    invalid_extra = true;
+                                } // 第二个 ctx 视为错误
                                 wants_ctx = true;
                             } else {
                                 invalid_extra = true; // 非 ctx 参数
@@ -359,8 +372,20 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                         }
                     }
                 }
-                if invalid_extra { compile_errors.push(syn::Error::new_spanned(&m.sig, "#[init] only allows optional &ComponentContext").to_compile_error()); }
-                inits.push(InitSpec { ident: m.sig.ident.clone(), wants_ctx, ret_case: analyze_return(&m.sig) });
+                if invalid_extra {
+                    compile_errors.push(
+                        syn::Error::new_spanned(
+                            &m.sig,
+                            "#[init] only allows optional &ComponentContext",
+                        )
+                        .to_compile_error(),
+                    );
+                }
+                inits.push(InitSpec {
+                    ident: m.sig.ident.clone(),
+                    wants_ctx,
+                    ret_case: analyze_return(&m.sig),
+                });
             }
             if has_stop {
                 let mut extraneous = Vec::new();
@@ -369,19 +394,33 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                 for arg in &m.sig.inputs {
                     if let syn::FnArg::Typed(p) = arg {
                         if is_ctx_type(&p.ty) {
-                            if wants_ctx { duplicate_ctx = true; }
+                            if wants_ctx {
+                                duplicate_ctx = true;
+                            }
                             wants_ctx = true;
                         } else {
                             extraneous.push(p.ty.clone());
                         }
                     }
                 }
-                if duplicate_ctx { compile_errors.push(syn::Error::new_spanned(&m.sig, "#[stop] allows at most one &ComponentContext parameter").to_compile_error()); }
+                if duplicate_ctx {
+                    compile_errors.push(
+                        syn::Error::new_spanned(
+                            &m.sig,
+                            "#[stop] allows at most one &ComponentContext parameter",
+                        )
+                        .to_compile_error(),
+                    );
+                }
                 if !extraneous.is_empty() {
                     compile_errors.push(syn::Error::new_spanned(&m.sig, "#[stop] method must take only self or optionally &self plus &ComponentContext").to_compile_error());
                 }
                 if !duplicate_ctx && extraneous.is_empty() {
-                    stops.push(StopSpec { ident: m.sig.ident.clone(), wants_ctx, ret_case: analyze_return(&m.sig) });
+                    stops.push(StopSpec {
+                        ident: m.sig.ident.clone(),
+                        wants_ctx,
+                        ret_case: analyze_return(&m.sig),
+                    });
                 }
             }
         }
@@ -393,11 +432,16 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
         phase: &str,
         call_core: proc_macro2::TokenStream,
         rc: &RetCase,
+        abort_on_error: bool,
     ) -> proc_macro2::TokenStream {
         match rc {
             RetCase::Unit => quote! { let _ = #call_core.await; },
             RetCase::ResultUnit => {
-                quote! { if let Err(e)=#call_core.await { tracing::warn!(error=?e, #phase); } }
+                if abort_on_error {
+                    quote! { if let Err(e)=#call_core.await { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&ctx); return Err(e); } }
+                } else {
+                    quote! { if let Err(e)=#call_core.await { tracing::warn!(error=?e, #phase); } }
+                }
             }
             RetCase::Some => {
                 quote! { { let __v = #call_core.await; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
@@ -406,10 +450,18 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
                 quote! { { if let Some(__v)=#call_core.await { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
             }
             RetCase::ResultSome => {
-                quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e)=> tracing::warn!(error=?e, #phase) } }
+                if abort_on_error {
+                    quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e)=> { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&ctx); return Err(e); } } }
+                } else {
+                    quote! { match #call_core.await { Ok(v)=> mmg_microbus::component::__publish_auto(&ctx, v).await, Err(e)=> { tracing::warn!(error=?e, #phase); } } }
+                }
             }
             RetCase::ResultOption => {
-                quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e)=> tracing::warn!(error=?e, #phase) } }
+                if abort_on_error {
+                    quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e)=> { tracing::error!(error=?e, #phase); mmg_microbus::component::__startup_mark_failed(&ctx); return Err(e); } } }
+                } else {
+                    quote! { match #call_core.await { Ok(opt)=> if let Some(v)=opt { mmg_microbus::component::__publish_auto(&ctx, v).await }, Err(e)=> { tracing::warn!(error=?e, #phase); } } }
+                }
             }
         }
     }
@@ -417,8 +469,12 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
     let mut init_calls = Vec::new();
     for i in &inits {
         let ident = &i.ident;
-        let call_core = if i.wants_ctx { quote! { this.#ident(&ctx) } } else { quote! { this.#ident() } };
-        let call_expr = gen_ret_case_tokens("init returned error", call_core, &i.ret_case);
+        let call_core = if i.wants_ctx {
+            quote! { this.#ident(&ctx) }
+        } else {
+            quote! { this.#ident() }
+        };
+        let call_expr = gen_ret_case_tokens("init returned error", call_core, &i.ret_case, true);
         init_calls.push(quote! { { #call_expr } });
     }
     let mut stop_calls = Vec::new();
@@ -429,7 +485,7 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
         } else {
             quote! { this.#ident() }
         };
-        let call_expr = gen_ret_case_tokens("stop returned error", call_core, &s.ret_case);
+        let call_expr = gen_ret_case_tokens("stop returned error", call_core, &s.ret_case, false);
         stop_calls.push(quote! { { #call_expr } });
     }
 
@@ -446,7 +502,8 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
         } else {
             quote! { this.#method_ident(&*env) }
         };
-        let call_expr = gen_ret_case_tokens("handle returned error", call_core, &ms.ret_case);
+        let call_expr =
+            gen_ret_case_tokens("handle returned error", call_core, &ms.ret_case, false);
         select_arms.push(quote! { msg = #sub_var.recv() => { match msg { Some(env) => { { #call_expr } } None => { break; } } } });
     }
 
@@ -459,7 +516,7 @@ pub(crate) fn generate_run_impl_inner(item: ItemImpl, self_ty: &syn::Type) -> To
         } else {
             quote! { this.#method_ident() }
         };
-        let call_expr = gen_ret_case_tokens("active returned error", call_core, &a.ret_case);
+        let call_expr = gen_ret_case_tokens("active returned error", call_core, &a.ret_case, false);
         if a.kind == ActiveKind::Once {
             once_calls.push(call_expr);
         } else {
