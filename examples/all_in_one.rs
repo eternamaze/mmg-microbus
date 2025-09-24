@@ -43,7 +43,8 @@ impl Feeder {
         tokio::task::yield_now().await;
         // 只发布偶数 tick 对应的 Price
         let n: u32 = P.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 2 == 0 {
+        // clippy: manual_is_multiple_of -> use stable API
+        if n.is_multiple_of(2) {
             Some(Price(u64::from(n)))
         } else {
             None
@@ -63,7 +64,8 @@ impl Feeder {
     async fn result_maybe(&self) -> Result<Option<Price>> {
         tokio::task::yield_now().await;
         let n: u32 = Q.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 3 == 0 {
+        // clippy: manual_is_multiple_of -> use stable API
+        if n.is_multiple_of(3) {
             Ok(Some(Price(1000 + u64::from(n))))
         } else {
             Ok(None)
@@ -114,7 +116,8 @@ impl Trader {
     ) -> Option<Price> {
         tokio::task::yield_now().await;
         let min_tick = self.min_tick;
-        if min_tick == 0 || tick.0 % min_tick == 0 {
+        // 保留 min_tick == 0 的短路，后半替换为 is_multiple_of 以满足 clippy
+        if min_tick == 0 || tick.0.is_multiple_of(min_tick) {
             // 将 Tick 转换成 Price；返回值即发布
             Some(Price(tick.0))
         } else {
