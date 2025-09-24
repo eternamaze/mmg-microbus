@@ -10,12 +10,11 @@
 //! - #[stop]      : 退出前一次调用
 
 use proc_macro::TokenStream;
-
-mod gen; // 私有实现模块
+mod codegen; // 分层实现：parse / analyze / emit
 
 #[proc_macro_attribute]
 pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
-    gen::component_entry(args, input)
+    codegen::entrypoint(args, input)
 }
 
 #[proc_macro_attribute]

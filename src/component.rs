@@ -54,44 +54,29 @@ impl StopFlag {
 }
 
 pub struct ComponentContext {
-    name: Arc<str>,
     bus: BusHandle,
     stop: Arc<StopFlag>,
     startup: Arc<StartupBarrier>,
 }
 
 impl ComponentContext {
-    // 组件标识符仅供运行期内部使用；不对业务暴露寻址能力
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn new_with_service(
-        name: String,
+    pub const fn new_with_service(
         bus: BusHandle,
         stop: Arc<StopFlag>,
         startup: Arc<StartupBarrier>,
     ) -> Self {
-        Self {
-            name: Arc::<str>::from(name),
-            bus,
-            stop,
-            startup,
-        }
+        Self { bus, stop, startup }
     }
 
     // 仅保留单一构造路径，避免歧义；组件以 kind 进行类型化
 
     // 发布采用“返回值即发布”模型（由宏注入的内部助手完成）
-    // 仅支持强类型通道（&T），不提供 Any 装配
-
-    // 配置不支持热更新：仅在启动时注入一次
+    // 仅支持强类型通道（&T），不提供 Any 装配；配置不支持热更新
 
     #[doc(hidden)]
     #[must_use]
     pub fn __fork(&self) -> Self {
         Self {
-            name: self.name.clone(),
             bus: self.bus.clone(),
             stop: self.stop.clone(),
             startup: self.startup.clone(),
@@ -99,7 +84,7 @@ impl ComponentContext {
     }
 }
 
-// (已移除外部配置注入模型) 保留空行占位，避免误解：组件自管内部初始化，不支持 #[init](&Cfg)
+// 外部配置注入模型已移除：组件自管内部初始化，不支持 #[init](&Cfg)
 
 /// 订阅封装（不含协作停机）
 pub struct AutoSubscription<T> {
@@ -139,11 +124,6 @@ pub async fn __recv_stop(ctx: &ComponentContext) {
     ctx.stop.notify.notified().await;
 }
 
-// 框架内部可见：用于 App 停机触发
-pub(crate) fn __trigger_stop(ctx: &ComponentContext) {
-    ctx.stop.trigger();
-}
-
 pub(crate) fn __new_stop_flag() -> Arc<StopFlag> {
     Arc::new(StopFlag::new())
 }
@@ -168,21 +148,24 @@ impl StartupBarrier {
             failed: AtomicBool::new(false),
         }
     }
+    #[inline]
+    fn is_ready(&self) -> bool {
+        self.arrived.load(Ordering::Acquire) >= self.total || self.failed.load(Ordering::Acquire)
+    }
+
+    async fn wait_ready(&self) {
+        while !self.is_ready() {
+            self.notify.notified().await;
+        }
+    }
+
     async fn arrive_and_wait(&self) {
         let n = self.arrived.fetch_add(1, Ordering::AcqRel) + 1;
         if n == self.total {
             self.notify.notify_waiters();
             return;
         }
-        // 等待所有组件到达
-        loop {
-            if self.arrived.load(Ordering::Acquire) >= self.total
-                || self.failed.load(Ordering::Acquire)
-            {
-                break;
-            }
-            self.notify.notified().await;
-        }
+        self.wait_ready().await;
     }
     pub fn mark_failed(&self) {
         if !self.failed.swap(true, Ordering::AcqRel) {
@@ -193,14 +176,7 @@ impl StartupBarrier {
         self.failed.load(Ordering::Acquire)
     }
     pub async fn wait_all(&self) {
-        loop {
-            if self.arrived.load(Ordering::Acquire) >= self.total
-                || self.failed.load(Ordering::Acquire)
-            {
-                break;
-            }
-            self.notify.notified().await;
-        }
+        self.wait_ready().await;
     }
 }
 

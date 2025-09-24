@@ -108,6 +108,63 @@ impl Bus {
 }
 
 impl BusHandle {
+    #[inline]
+    fn is_sealed(&self) -> bool {
+        self.inner.sealed.load(Ordering::Acquire)
+    }
+    #[inline]
+    async fn send_one<T: Send + Sync + 'static>(&self, tx: &mpsc::Sender<Arc<T>>, arc: Arc<T>) {
+        match tx.try_send(arc.clone()) {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let _ = tx.send(arc).await;
+            }
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    #[inline]
+    async fn send_pending_by_index<T: Send + Sync + 'static>(
+        senders: &[mpsc::Sender<Arc<T>>],
+        pending_idx: &[usize],
+        arc: Arc<T>,
+    ) {
+        if pending_idx.is_empty() {
+            return;
+        }
+        let last = pending_idx.len() - 1;
+        for &i in &pending_idx[..last] {
+            let _ = senders[i].send(arc.clone()).await;
+        }
+        let _ = senders[pending_idx[last]].send(arc).await;
+    }
+
+    #[inline]
+    fn get_frozen_senders<T: Send + Sync + 'static>(
+        &self,
+        type_id: TypeId,
+    ) -> Option<Arc<[mpsc::Sender<Arc<T>>]>> {
+        let subs = self.inner.subs.read();
+        subs.get(&type_id)
+            .and_then(|entry| entry.as_any().downcast_ref::<TypeIndex<T>>())
+            .and_then(|idx| idx.frozen_any.clone())
+    }
+
+    #[inline]
+    fn get_open_senders_unsealed<T: Send + Sync + 'static>(&self, type_id: TypeId) -> SenderVec<T> {
+        let mut opened: SenderVec<T> = SmallVec::new();
+        if let Some(entry) = self.inner.subs.read().get(&type_id) {
+            if let Some(idx) = entry.as_any().downcast_ref::<TypeIndex<T>>() {
+                for tx in &idx.any {
+                    if !tx.is_closed() {
+                        opened.push(tx.clone());
+                    }
+                }
+            } else {
+                tracing::error!("type mismatch in type index for this type");
+            }
+        }
+        opened
+    }
     pub(crate) fn subscribe_type<T: Send + Sync + 'static>(&self) -> Subscription<T> {
         assert!(
             !self.inner.sealed.load(Ordering::Acquire),
@@ -116,18 +173,18 @@ impl BusHandle {
         let cap = self.inner.default_capacity;
         let type_id = TypeId::of::<T>();
         let (tx_local, rx) = mpsc::channel::<Arc<T>>(cap);
+        if let Some(entry) = self
+            .inner
+            .subs
+            .write()
+            .entry(type_id)
+            .or_insert_with(|| Box::<TypeIndex<T>>::default() as Box<dyn TypeIndexEntry>)
+            .as_any_mut()
+            .downcast_mut::<TypeIndex<T>>()
         {
-            let mut map = self.inner.subs.write();
-            let entry = map
-                .entry(type_id)
-                .or_insert_with(|| Box::<TypeIndex<T>>::default() as Box<dyn TypeIndexEntry>);
-            if let Some(idx) = entry.as_any_mut().downcast_mut::<TypeIndex<T>>() {
-                idx.any.push(tx_local);
-            } else {
-                tracing::error!("type index downcast failed; subscription ignored");
-            }
-            // drop lock early
-            drop(map);
+            entry.any.push(tx_local);
+        } else {
+            tracing::error!("type index downcast failed; subscription ignored");
         }
         Subscription { rx }
     }
@@ -136,7 +193,7 @@ impl BusHandle {
         // 顺序语义：同一类型的消息进入每个订阅者通道的顺序=各 publish 调用实际完成入队的顺序；无全局跨组件开播时间排序保证。
         let type_id = TypeId::of::<T>();
         let arc = Arc::new(msg);
-        if self.inner.sealed.load(Ordering::Acquire) {
+        if self.is_sealed() {
             self.publish_type_sealed::<T>(type_id, arc).await;
         } else {
             self.publish_type_unsealed::<T>(type_id, arc).await;
@@ -144,94 +201,46 @@ impl BusHandle {
     }
 
     async fn publish_type_sealed<T: Send + Sync + 'static>(&self, type_id: TypeId, arc: Arc<T>) {
-        let frozen: Option<Arc<[mpsc::Sender<Arc<T>>]>> = {
-            let subs = self.inner.subs.read();
-            subs.get(&type_id)
-                .and_then(|entry| entry.as_any().downcast_ref::<TypeIndex<T>>())
-                .and_then(|idx| idx.frozen_any.clone())
-        };
-        if let Some(frozen) = frozen {
-            if frozen.len() == 1 {
-                let tx = &frozen[0];
-                match tx.try_send(arc.clone()) {
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        let _ = tx.send(arc).await;
-                    }
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                }
-                return;
-            }
-            let mut pending_idx: SmallVec<[usize; 8]> = SmallVec::new();
-            for (i, tx) in frozen.iter().enumerate() {
-                match tx.try_send(arc.clone()) {
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending_idx.push(i),
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                }
-            }
-            if !pending_idx.is_empty() {
-                let last = pending_idx.len() - 1;
-                for &i in &pending_idx[..last] {
-                    let _ = frozen[i].send(arc.clone()).await;
-                }
-                let _ = frozen[pending_idx[last]].send(arc).await;
-            }
+        if let Some(frozen) = self.get_frozen_senders::<T>(type_id) {
+            self.publish_to_senders(&frozen, arc).await;
         }
     }
 
     async fn publish_type_unsealed<T: Send + Sync + 'static>(&self, type_id: TypeId, arc: Arc<T>) {
-        let (open_count, idx_any): (usize, Option<SenderVec<T>>) = {
-            let subs = self.inner.subs.read();
-            subs.get(&type_id).map_or_else(
-                || (0, None),
-                |entry| {
-                    entry.as_any().downcast_ref::<TypeIndex<T>>().map_or_else(
-                        || {
-                            tracing::error!("type mismatch in type index for this type");
-                            (0, None)
-                        },
-                        |idx| {
-                            let mut opened: SenderVec<T> = SmallVec::new();
-                            for tx in &idx.any {
-                                if !tx.is_closed() {
-                                    opened.push(tx.clone());
-                                }
-                            }
-                            let c = opened.len();
-                            (c, Some(opened))
-                        },
-                    )
-                },
-            )
-        };
-        if open_count == 0 {
-            return;
-        }
-        let Some(senders) = idx_any else {
-            return;
-        };
-        if open_count == 1 {
-            let tx = &senders[0];
+        let senders = self.get_open_senders_unsealed::<T>(type_id);
+        self.publish_to_senders(&senders, arc).await;
+    }
+
+    #[inline]
+    fn try_send_collect_pending<T: Send + Sync + 'static>(
+        senders: &[mpsc::Sender<Arc<T>>],
+        arc: &Arc<T>,
+    ) -> SmallVec<[usize; 8]> {
+        let mut pending_idx: SmallVec<[usize; 8]> = SmallVec::new();
+        for (i, tx) in senders.iter().enumerate() {
             match tx.try_send(arc.clone()) {
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    let _ = tx.send(arc).await;
-                    return;
-                }
-                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
-            }
-        }
-        let mut pending: SmallVec<[mpsc::Sender<Arc<T>>; 8]> = SmallVec::new();
-        for tx in &senders {
-            match tx.try_send(arc.clone()) {
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending.push(tx.clone()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending_idx.push(i),
                 Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
-        if !pending.is_empty() {
-            let last = pending.len() - 1;
-            for i in 0..last {
-                let _ = pending[i].send(arc.clone()).await;
+        pending_idx
+    }
+
+    #[inline]
+    async fn publish_to_senders<T: Send + Sync + 'static>(
+        &self,
+        senders: &[mpsc::Sender<Arc<T>>],
+        arc: Arc<T>,
+    ) {
+        match senders.len() {
+            0 => {}
+            1 => {
+                self.send_one(&senders[0], arc).await;
             }
-            let _ = pending[last].send(arc).await;
+            _ => {
+                let pending_idx = Self::try_send_collect_pending(senders, &arc);
+                Self::send_pending_by_index::<T>(senders, &pending_idx, arc).await;
+            }
         }
     }
     // 发布接口：仅供宏生成代码内部使用

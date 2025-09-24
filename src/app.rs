@@ -35,24 +35,25 @@ impl App {
     }
 
     // 框架配置仅能在 new() 时提供；运行期不支持修改。
-    /// 启动并运行所有通过 inventory 注册的组件。
-    ///
-    /// # Errors
-    /// 当任一组件构建或初始化失败时返回错误，并触发整个应用停机。
-    ///
-    /// # Panics
-    /// 内部依赖的启动屏障未正确设置时可能触发 panic（仅限编程错误场景）。
-    pub async fn start(&mut self) -> Result<()> {
-        if self.started {
-            return Ok(());
-        }
-        // 自动发现：inventory 收集的所有工厂；按 kind 去重（单例模式）。
-        let bus_handle = self.bus.handle();
-        let factories: Vec<&__RegisteredFactory> =
-            inventory::iter::<__RegisteredFactory>.into_iter().collect();
-        let total = factories.len();
-        let startup_barrier = __new_startup_barrier(total);
-        self.startup_barrier = Some(startup_barrier.clone());
+    /// 发现并收集所有通过 inventory 注册的组件工厂。
+    fn discover_factories() -> Vec<&'static __RegisteredFactory> {
+        inventory::iter::<__RegisteredFactory>.into_iter().collect()
+    }
+
+    async fn await_startup_and_seal(
+        &self,
+        barrier_ref: &std::sync::Arc<crate::component::StartupBarrier>,
+    ) {
+        crate::component::__startup_wait_all(barrier_ref).await;
+        self.bus.handle().seal();
+    }
+
+    fn spawn_components(
+        &mut self,
+        factories: &[&__RegisteredFactory],
+        bus_handle: &BusHandle,
+        startup_barrier: &std::sync::Arc<crate::component::StartupBarrier>,
+    ) {
         for reg in factories {
             let factory = (reg.create)();
             let name = factory.type_name().to_string();
@@ -63,7 +64,6 @@ impl App {
                 match factory.build(bus_clone.clone()).await {
                     Ok(comp) => {
                         let ctx = ComponentContext::new_with_service(
-                            name.clone(),
                             bus_clone.clone(),
                             stop_clone.clone(),
                             barrier_clone.clone(),
@@ -82,16 +82,44 @@ impl App {
             let h = tokio::spawn(fut);
             self.tasks.push(h);
         }
-        // 等待所有组件到达启动屏障或有失败发生
-        crate::component::__startup_wait_all(self.startup_barrier.as_ref().unwrap()).await;
-        // 冻结 bus：后续不再期望新增订阅
-        self.bus.handle().seal();
-        // 若启动阶段存在失败，触发停机并返回错误
-        if crate::component::__startup_failed(self.startup_barrier.as_ref().unwrap()) {
+    }
+
+    async fn handle_start_failure(
+        &mut self,
+        barrier: std::sync::Arc<crate::component::StartupBarrier>,
+    ) -> Result<()> {
+        if crate::component::__startup_failed(&barrier) {
             self.stop().await;
             self.started = false;
             return Err(MicrobusError::Other("app start aborted: init/build failed"));
         }
+        Ok(())
+    }
+
+    /// 启动并运行所有通过 inventory 注册的组件。
+    ///
+    /// # Errors
+    /// 当任一组件构建或初始化失败时返回错误，并触发整个应用停机。
+    ///
+    /// # Panics
+    /// 内部依赖的启动屏障未正确设置时可能触发 panic（仅限编程错误场景）。
+    pub async fn start(&mut self) -> Result<()> {
+        if self.started {
+            return Ok(());
+        }
+        // 自动发现：inventory 收集的所有工厂；按 kind 去重（单例模式）。
+        let bus_handle = self.bus.handle();
+        let factories: Vec<&__RegisteredFactory> = Self::discover_factories();
+        let total = factories.len();
+        let startup_barrier = __new_startup_barrier(total);
+        self.startup_barrier = Some(startup_barrier.clone());
+        self.spawn_components(&factories, &bus_handle, &startup_barrier);
+        let barrier_ref = self
+            .startup_barrier
+            .as_ref()
+            .expect("startup_barrier must be set before waiting");
+        self.await_startup_and_seal(barrier_ref).await; // 阶段：等待并封印
+        self.handle_start_failure(barrier_ref.clone()).await?; // 阶段：失败分支
         self.started = true;
         Ok(())
     }
