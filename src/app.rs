@@ -44,8 +44,13 @@ impl App {
         &self,
         barrier_ref: &std::sync::Arc<crate::component::StartupBarrier>,
     ) {
+        // Wait until all components arrived OR startup is marked failed.
         crate::component::__startup_wait_all(barrier_ref).await;
-        self.bus.handle().seal();
+        // Only seal the bus when startup succeeded. If startup failed, components may not have
+        // finished pre-barrier subscription steps; sealing here would cause panics on subscribe.
+        if !crate::component::__startup_failed(barrier_ref) {
+            self.bus.handle().seal();
+        }
     }
 
     fn spawn_components(
