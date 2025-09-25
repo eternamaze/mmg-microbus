@@ -41,7 +41,7 @@ async fn active_once_executes_exactly_once() {
     let mut app = App::new(mmg_microbus::config::AppConfig::default());
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    app.stop().await;
+    app.stop();
     assert_eq!(
         ACTIVE_CALLS.load(Ordering::SeqCst),
         1,

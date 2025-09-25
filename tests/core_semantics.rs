@@ -42,8 +42,7 @@ impl Trader {
         Some(Price(t.0 + self.bias))
     }
     #[mmg_microbus::stop]
-    async fn on_stop(&self) -> Stopped {
-        tokio::task::yield_now().await;
+    fn on_stop(&self) -> Stopped {
         STOP_CALLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Stopped("bye")
     }
@@ -70,6 +69,6 @@ async fn end_to_end_flow_and_stop() {
     app.start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     assert!(SEEN_PRICE.load(std::sync::atomic::Ordering::SeqCst) > 0);
-    app.stop().await;
+    app.stop();
     assert!(STOP_CALLED.load(std::sync::atomic::Ordering::SeqCst) >= 1);
 }

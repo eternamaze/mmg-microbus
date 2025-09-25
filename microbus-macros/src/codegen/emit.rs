@@ -82,7 +82,7 @@ pub fn build_active_parts(actives: &[ActiveSpec]) -> (Vec<proc_macro2::TokenStre
 
 pub fn gen_component_run(self_ty: &syn::Type, parts: &RunParts, item: &ItemImpl) -> proc_macro2::TokenStream {
     let RunParts { init_calls, stop_calls, sub_decls, handle_spawns, active_spawns, once_calls, compile_errors } = parts;
-    let gen_run = quote! { #[async_trait::async_trait] impl mmg_microbus::component::Component for #self_ty { async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> mmg_microbus::error::Result<()> { let mut this=*self; #( #init_calls )* let this=std::sync::Arc::new(this); #( #sub_decls )* mmg_microbus::component::__startup_arrive_and_wait(&ctx).await; { #( #once_calls )* } let mut __workers:Vec<tokio::task::JoinHandle<()>>=Vec::new(); #( #handle_spawns )* #( #active_spawns )* mmg_microbus::component::__recv_stop(&ctx).await; for h in __workers { let _ = h.await; } #( #stop_calls )* Ok(()) } } };
+    let gen_run = quote! { #[async_trait::async_trait] impl mmg_microbus::component::Component for #self_ty { async fn run(self: Box<Self>, mut ctx: mmg_microbus::component::ComponentContext) -> mmg_microbus::error::Result<()> { let mut this=*self; #( #init_calls )* let this=std::sync::Arc::new(this); #( #sub_decls )* mmg_microbus::component::__startup_arrive_and_wait(&ctx).await; { #( #once_calls )* } let mut __workers:Vec<tokio::task::JoinHandle<()>>=Vec::new(); #( #handle_spawns )* #( #active_spawns )* mmg_microbus::component::__recv_stop(&ctx).await; #( #stop_calls )* Ok(()) } } };
     let mut errs_ts = proc_macro2::TokenStream::new(); for e in compile_errors { errs_ts.extend(e.clone()); }
     quote! { #item #gen_run #errs_ts }
 }

@@ -1,7 +1,8 @@
 use super::msgs::{
     ERR_ACTIVE_CTX_DUP, ERR_ACTIVE_MUT_SELF, ERR_ACTIVE_ONLY_CTX, ERR_HANDLE_CTX_DUP,
     ERR_HANDLE_MULTI_ATTR, ERR_HANDLE_MUT_SELF, ERR_HANDLE_NEED_ONE_T, ERR_HANDLE_NO_ARGS,
-    ERR_HANDLE_ONLY_ONE_T, ERR_INIT_SIG, ERR_STOP_CTX_DUP, ERR_STOP_MUT_SELF, ERR_STOP_SIG,
+    ERR_HANDLE_ONLY_ONE_T, ERR_INIT_SIG, ERR_STOP_ASYNC_NOT_ALLOWED, ERR_STOP_CTX_DUP,
+    ERR_STOP_MUT_SELF, ERR_STOP_SIG,
 };
 use quote::quote;
 use syn::{ItemImpl, Type};
@@ -268,6 +269,11 @@ pub fn handle_init_fn(m: &syn::ImplItemFn) -> (Option<InitSpec>, Option<proc_mac
 
 pub fn handle_stop_fn(m: &syn::ImplItemFn) -> (Option<StopSpec>, Vec<proc_macro2::TokenStream>) {
     let mut compile_errors = Vec::new();
+    // Enforce: #[stop] must be synchronous (non-async)
+    if m.sig.asyncness.is_some() {
+        compile_errors
+            .push(syn::Error::new_spanned(&m.sig, ERR_STOP_ASYNC_NOT_ALLOWED).to_compile_error());
+    }
     if let Some(rcv) = m.sig.receiver() {
         if rcv.mutability.is_some() {
             compile_errors

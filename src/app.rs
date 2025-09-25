@@ -91,7 +91,7 @@ impl App {
         barrier: std::sync::Arc<crate::component::StartupBarrier>,
     ) -> Result<()> {
         if crate::component::__startup_failed(&barrier) {
-            self.stop().await;
+            self.stop();
             self.started = false;
             return Err(MicrobusError::Other("app start aborted: init/build failed"));
         }
@@ -125,16 +125,23 @@ impl App {
         self.started = true;
         Ok(())
     }
-    pub async fn stop(&mut self) {
+    pub fn stop(&mut self) {
         // 框架主导的单方面停机：
         // 1) 发出停止信号；
         __trigger_stop_flag(&self.stop_flag);
         // 2) 强制结束所有组件任务（无需等待其“自然退出”）。
         let mut rest = Vec::new();
         rest.append(&mut self.tasks);
+        // 安排后台收割：给予极短宽限以便组件在其任务内执行同步 stop 钩子，然后强制 abort 并回收 JoinHandle
         for h in rest {
-            // 组件 run() 应该在收到停止后尽快返回；这里直接等待一次 join，若 panic/取消也忽略。
-            let _ = h.await;
+            tokio::spawn(async move {
+                let grace = std::time::Duration::from_millis(50);
+                let _ = tokio::time::sleep(grace).await;
+                if !h.is_finished() {
+                    h.abort();
+                }
+                let _ = h.await;
+            });
         }
         self.started = false;
     }

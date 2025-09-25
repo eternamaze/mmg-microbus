@@ -152,8 +152,7 @@ impl Trader {
 
     // 停止钩子：返回 T 被发布
     #[mmg_microbus::stop]
-    async fn on_stop(&self) -> Stopped {
-        tokio::task::yield_now().await;
+    fn on_stop(&self) -> Stopped {
         Stopped("bye")
     }
 }
@@ -166,7 +165,6 @@ struct Collector;
 impl Collector {
     #[mmg_microbus::handle]
     async fn on_stopped(&self, _ctx: &mmg_microbus::component::ComponentContext, s: &Stopped) {
-        tokio::task::yield_now().await;
         let _ = s.0; // 读取以避免告警
     }
 }
@@ -183,6 +181,6 @@ async fn main() -> Result<()> {
     // 从外部发布消息：已移除对外发布 API（示例省略）
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    app.stop().await;
+    app.stop();
     Ok(())
 }

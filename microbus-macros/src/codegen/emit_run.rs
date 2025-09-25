@@ -34,13 +34,24 @@ pub fn build_init_stop_calls(
         } else {
             quote! { this.#ident() }
         };
-        let expr = gen_ret_case_tokens(
-            "stop returned error",
-            &core,
-            &s.ret_case,
-            false,
-            &quote! {ctx},
-        );
+        let expr = match &s.ret_case {
+            super::analyze::RetCase::Unit => quote! { let _ = #core; },
+            super::analyze::RetCase::ResultUnit => {
+                quote! { match #core { Ok(()) => {}, Err(e) => { tracing::warn!(error=?e, "stop returned error"); } } }
+            }
+            super::analyze::RetCase::Some => {
+                quote! { { let __v = #core; mmg_microbus::component::__publish_auto(&ctx, __v).await; } }
+            }
+            super::analyze::RetCase::OptionSome => {
+                quote! { { if let Some(__v) = #core { mmg_microbus::component::__publish_auto(&ctx, __v).await; } } }
+            }
+            super::analyze::RetCase::ResultSome => {
+                quote! { match #core { Ok(v) => { mmg_microbus::component::__publish_auto(&ctx, v).await; }, Err(e) => { tracing::warn!(error=?e, "stop returned error"); } } }
+            }
+            super::analyze::RetCase::ResultOption => {
+                quote! { match #core { Ok(opt) => { if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await; } }, Err(e) => { tracing::warn!(error=?e, "stop returned error"); } } }
+            }
+        };
         stop_calls.push(quote! { { #expr } });
     }
     (init_calls, stop_calls)
@@ -71,7 +82,7 @@ pub fn gen_component_run(
         once_calls,
         compile_errors,
     } = parts;
-    // run 本体：阶段顺序：init -> 订阅声明 -> startup barrier -> once -> workers -> 等待 stop -> stop 钩子
+    // run 本体：阶段顺序：init -> 订阅声明 -> startup barrier -> once -> workers -> 等待 stop -> 立刻调用 stop 钩子（不等待 worker）
     let run_impl = quote! {
         #[async_trait::async_trait]
         impl mmg_microbus::component::Component for #self_ty {
@@ -84,7 +95,7 @@ pub fn gen_component_run(
                 #( #handle_spawns )*
                 #( #active_spawns )*
                 mmg_microbus::component::__recv_stop(&ctx).await;
-                for h in __workers { let _ = h.await; }
+                // 同步停机契约：收到 stop 后立即执行 stop 钩子，不等待任何 worker 结束
                 #( #stop_calls )*
                 Ok(())
             }

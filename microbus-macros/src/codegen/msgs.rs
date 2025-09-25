@@ -29,4 +29,7 @@ pub(super) const ERR_STOP_CTX_DUP: &str = "#[stop] allows at most one &Component
 pub(super) const ERR_STOP_SIG: &str =
     "#[stop] method must take only self or optionally &self plus &ComponentContext";
 
+pub(super) const ERR_STOP_ASYNC_NOT_ALLOWED: &str =
+    "#[stop] must be a synchronous function (do not mark it async)";
+
 pub(super) const ERR_COMPONENT_TARGET: &str = "#[component] only supports struct or impl blocks";
