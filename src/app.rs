@@ -63,6 +63,8 @@ impl App {
             let fut = async move {
                 match factory.build(bus_clone.clone()).await {
                     Ok(comp) => {
+                        // 注意：ComponentContext::new_with_service 仅在 crate 内部可见，
+                        // 组件上下文的构造必须走 App 流程以确保启动屏障与总线 seal 顺序正确。
                         let ctx = ComponentContext::new_with_service(
                             bus_clone.clone(),
                             stop_clone.clone(),

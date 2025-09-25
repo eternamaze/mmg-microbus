@@ -60,7 +60,8 @@ pub struct ComponentContext {
 }
 
 impl ComponentContext {
-    pub const fn new_with_service(
+    // 仅框架内部用于 App->Component 的构造路径，不对外暴露，以避免外部绕开 App 生命周期管理直接构造上下文。
+    pub(crate) const fn new_with_service(
         bus: BusHandle,
         stop: Arc<StopFlag>,
         startup: Arc<StartupBarrier>,

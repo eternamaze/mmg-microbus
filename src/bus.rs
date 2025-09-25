@@ -247,7 +247,7 @@ impl BusHandle {
 
     #[cfg(test)]
     #[must_use]
-    pub fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
+    pub(crate) fn debug_count_subscribers<T: Send + Sync + 'static>(&self) -> usize {
         let type_id = TypeId::of::<T>();
         let subs = self.inner.subs.read();
         subs.get(&type_id)
