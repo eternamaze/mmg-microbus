@@ -308,6 +308,9 @@ mod perf_tests {
             });
         }
 
+        // 测试环境下验证订阅者计数工具，避免 dead_code 且校验预期的订阅规模
+        assert_eq!(handle.debug_count_subscribers::<Msg>(), n_subs);
+
         // 封印后进入发布快路径
         handle.seal();
 
