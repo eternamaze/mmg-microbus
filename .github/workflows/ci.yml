@@ -20,9 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 安装 Rust toolchain + rustfmt 组件
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
 
   clippy:
     name: clippy (deny warnings)
@@ -30,9 +34,13 @@ jobs:
     needs: [fmt]
     steps:
       - uses: actions/checkout@v4
+      # 安装 Rust toolchain + clippy 组件
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     name: build workspace
@@ -42,7 +50,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-targets --locked
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
 
   test:
     name: test workspace
@@ -52,5 +61,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets --locked
-
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
