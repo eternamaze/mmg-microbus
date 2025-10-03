@@ -51,6 +51,33 @@ pub fn build_init_stop_calls(
             super::analyze::RetCase::ResultOption => {
                 quote! { match #core { Ok(opt) => { if let Some(v) = opt { mmg_microbus::component::__publish_auto(&ctx, v).await; } }, Err(e) => { tracing::warn!(error=?e, "stop returned error"); } } }
             }
+            super::analyze::RetCase::Erased => {
+                quote! { { let __e = #core; mmg_microbus::component::__publish_erased(&ctx,__e).await; } }
+            }
+            super::analyze::RetCase::OptionErased => {
+                quote! { { if let Some(__e)=#core { mmg_microbus::component::__publish_erased(&ctx,__e).await; } } }
+            }
+            super::analyze::RetCase::VecErased => {
+                quote! { { let __vec = #core; for __e in __vec { mmg_microbus::component::__publish_erased(&ctx,__e).await; } } }
+            }
+            super::analyze::RetCase::AnyBox => {
+                quote! { { let __b = #core; mmg_microbus::component::__publish_any_box(&ctx,__b).await; } }
+            }
+            super::analyze::RetCase::AnyArc => {
+                quote! { { let __a = #core; mmg_microbus::component::__publish_any_arc(&ctx,__a).await; } }
+            }
+            super::analyze::RetCase::OptionAnyBox => {
+                quote! { { if let Some(__b)=#core { mmg_microbus::component::__publish_any_box(&ctx,__b).await; } } }
+            }
+            super::analyze::RetCase::OptionAnyArc => {
+                quote! { { if let Some(__a)=#core { mmg_microbus::component::__publish_any_arc(&ctx,__a).await; } } }
+            }
+            super::analyze::RetCase::ResultAnyBox => {
+                quote! { match #core { Ok(__b)=> mmg_microbus::component::__publish_any_box(&ctx,__b).await, Err(e)=>{ tracing::warn!(error=?e, "stop returned error"); } } }
+            }
+            super::analyze::RetCase::ResultAnyArc => {
+                quote! { match #core { Ok(__a)=> mmg_microbus::component::__publish_any_arc(&ctx,__a).await, Err(e)=>{ tracing::warn!(error=?e, "stop returned error"); } } }
+            }
         };
         stop_calls.push(quote! { { #expr } });
     }

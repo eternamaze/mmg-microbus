@@ -115,6 +115,20 @@ pub async fn __publish_auto<T: Send + Sync + 'static>(ctx: &ComponentContext, ms
     ctx.bus.publish_type(msg).await;
 }
 
+// 发布 ErasedEvent：供宏在返回值为 ErasedEvent/Option/Vec<ErasedEvent> 时使用
+pub async fn __publish_erased(ctx: &ComponentContext, ev: crate::bus::ErasedEvent) {
+    // 直接调用存储在结构内的发布函数
+    (ev.publish_fn)(&ctx.bus, ev.data).await;
+}
+
+// 动态 Any（Box）发布：框架内部宏会在检测到函数返回 Box<dyn Any> / Result<Box<dyn Any>> / Option<Box<dyn Any>> 时调用。
+pub async fn __publish_any_box(ctx: &ComponentContext, b: Box<dyn Any + Send + Sync>) {
+    ctx.bus.publish_any_box(b).await;
+}
+pub async fn __publish_any_arc(ctx: &ComponentContext, a: std::sync::Arc<dyn Any + Send + Sync>) {
+    ctx.bus.publish_any_arc(a).await;
+}
+
 // 配置相关能力已移除：init 仅由组件自身内部逻辑决定，其它注入路径删除。
 
 /// 内部停止信号（仅供宏生成的 `run()` 使用）

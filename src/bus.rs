@@ -48,6 +48,16 @@ trait TypeIndexEntry: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn freeze(&mut self);
+    fn publish_box_dyn(
+        &self,
+        sealed: bool,
+        msg: Box<dyn Any + Send + Sync>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+    fn publish_arc_dyn(
+        &self,
+        sealed: bool,
+        msg: std::sync::Arc<dyn Any + Send + Sync>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
 impl<T: Send + Sync + 'static> TypeIndexEntry for TypeIndex<T> {
     fn as_any(&self) -> &dyn Any {
@@ -63,11 +73,113 @@ impl<T: Send + Sync + 'static> TypeIndexEntry for TypeIndex<T> {
             self.frozen_any = Some(Arc::<[mpsc::Sender<Arc<T>>]>::from(vec));
         }
     }
+    fn publish_box_dyn(
+        &self,
+        sealed: bool,
+        msg: Box<dyn Any + Send + Sync>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let val = *msg.downcast::<T>().expect("dynamic box downcast mismatch");
+        let arc = Arc::new(val);
+        if sealed {
+            if let Some(frozen) = self.frozen_any.clone() {
+                Box::pin(async move { publish_to_senders_static::<T>(&frozen, arc).await })
+            } else {
+                Box::pin(async {})
+            }
+        } else {
+            // 未封印：过滤关闭的 sender
+            let mut senders: SenderVec<T> = SmallVec::new();
+            for tx in &self.any {
+                if !tx.is_closed() {
+                    senders.push(tx.clone());
+                }
+            }
+            Box::pin(async move { publish_to_senders_static::<T>(&senders, arc).await })
+        }
+    }
+    fn publish_arc_dyn(
+        &self,
+        sealed: bool,
+        msg: std::sync::Arc<dyn Any + Send + Sync>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        // 尝试 Arc<dyn Any> -> Arc<T>
+        let arc_t: Arc<T> = match msg.downcast() {
+            Ok(v) => v,
+            Err(_) => panic!("dynamic arc downcast mismatch"),
+        };
+        if sealed {
+            if let Some(frozen) = self.frozen_any.clone() {
+                Box::pin(async move { publish_to_senders_static::<T>(&frozen, arc_t).await })
+            } else {
+                Box::pin(async {})
+            }
+        } else {
+            let mut senders: SenderVec<T> = SmallVec::new();
+            for tx in &self.any {
+                if !tx.is_closed() {
+                    senders.push(tx.clone());
+                }
+            }
+            Box::pin(async move { publish_to_senders_static::<T>(&senders, arc_t).await })
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct BusHandle {
     inner: Arc<BusInner>,
+}
+
+// ================= 动态事件发布支持（ErasedEvent + Any 弱类型） =================
+// 设计目的：
+// - 允许单个 active/handle 在运行时按分支返回不同具体类型，而无需为“少量试验型类型组合”提前设计枚举/联合体。
+// - ErasedEvent：携带发布函数指针 (publish_fn) + 类型擦除 Box<dyn Any>，框架调用时恢复为静态类型并走统一 publish_type<T> 快路径。
+// - Any（Box/Arc<dyn Any + Send + Sync>）弱类型：用于快速实验/临时 PoC；运行期直接按 TypeId 查订阅者并 downcast，一次性投递。
+// 契约（与文档 FULL_GUIDE.md 保持一致）：所有动态/弱类型路径最终“归约到 T 或 ()”。
+// 安全与失败处理：
+//   * ErasedEvent 内部 downcast mismatch -> panic：编程期逻辑错误（publish_fn 与携带数据不匹配），不隐藏以便尽早暴露。
+//   * Any 弱类型：若 TypeId 无订阅者 -> 静默丢弃；若内部 downcast 失败（不应发生，因为以 TypeId 精确检索）-> panic。
+// 性能：
+//   * Sealed 后：ErasedEvent / Any 动态路径均避免构建订阅快照；仅一次 HashMap 读 + downcast。
+//   * 未 sealed：动态路径每次过滤已关闭 sender，保持与静态路径一致的背压策略。
+use std::future::Future; // 局部导入以避免与其它模块冲突
+use std::pin::Pin;
+
+// === 类型别名（降低复杂度，满足 clippy::type-complexity） ===
+type PublishData = Box<dyn Any + Send + Sync>;
+type PublishFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type PublishFn = fn(&BusHandle, PublishData) -> PublishFuture;
+
+pub struct ErasedEvent {
+    pub(crate) publish_fn: PublishFn,
+    pub(crate) data: PublishData,
+}
+impl ErasedEvent {
+    pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
+        fn publish_impl<T: Send + Sync + 'static>(
+            bus: &BusHandle,
+            data: PublishData,
+        ) -> PublishFuture {
+            let handle = bus.clone();
+            let inner = *data
+                .downcast::<T>()
+                .expect("ErasedEvent type downcast mismatch");
+            Box::pin(async move { handle.publish_type(inner).await })
+        }
+        Self {
+            publish_fn: publish_impl::<T>,
+            data: Box::new(value),
+        }
+    }
+}
+
+pub trait IntoErasedEvent: Send + Sync + 'static {
+    fn into_erased(self) -> ErasedEvent;
+}
+impl<T: Send + Sync + 'static> IntoErasedEvent for T {
+    fn into_erased(self) -> ErasedEvent {
+        ErasedEvent::new(self)
+    }
 }
 
 struct BusInner {
@@ -253,6 +365,70 @@ impl BusHandle {
         subs.get(&type_id)
             .and_then(|entry| entry.as_any().downcast_ref::<TypeIndex<T>>())
             .map_or(0, |idx| idx.any.iter().filter(|tx| !tx.is_closed()).count())
+    }
+
+    // 动态消息发布：接收 Box<dyn Any>（业务返回值弱类型），按照其实际运行时 TypeId 精确投递。
+    pub async fn publish_any_box(&self, msg: Box<dyn Any + Send + Sync>) {
+        let type_id = (*msg).type_id();
+        let sealed = self.is_sealed();
+        let fut = {
+            let subs = self.inner.subs.read();
+            if let Some(entry) = subs.get(&type_id) {
+                entry.publish_box_dyn(sealed, msg)
+            } else {
+                // 无订阅者：静默丢弃
+                Box::pin(async {})
+            }
+        };
+        fut.await;
+    }
+    pub async fn publish_any_arc(&self, msg: Arc<dyn Any + Send + Sync>) {
+        let type_id = (*msg).type_id();
+        let sealed = self.is_sealed();
+        let fut = {
+            let subs = self.inner.subs.read();
+            if let Some(entry) = subs.get(&type_id) {
+                entry.publish_arc_dyn(sealed, msg)
+            } else {
+                Box::pin(async {})
+            }
+        };
+        fut.await;
+    }
+}
+
+// 提取一个静态泛型帮助函数，供动态路径重用。
+async fn publish_to_senders_static<T: Send + Sync + 'static>(
+    senders: &[mpsc::Sender<Arc<T>>],
+    arc: Arc<T>,
+) {
+    match senders.len() {
+        0 => {}
+        1 => match senders[0].try_send(arc.clone()) {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let _ = senders[0].send(arc).await;
+            }
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        },
+        _ => {
+            let pending_idx = {
+                let mut pending: SmallVec<[usize; 8]> = SmallVec::new();
+                for (i, tx) in senders.iter().enumerate() {
+                    match tx.try_send(arc.clone()) {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => pending.push(i),
+                        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
+                pending
+            };
+            if !pending_idx.is_empty() {
+                let last = pending_idx.len() - 1;
+                for &i in &pending_idx[..last] {
+                    let _ = senders[i].send(arc.clone()).await;
+                }
+                let _ = senders[pending_idx[last]].send(arc).await;
+            }
+        }
     }
 }
 

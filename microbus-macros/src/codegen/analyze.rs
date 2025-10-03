@@ -19,6 +19,15 @@ pub enum RetCase {
     ResultUnit,
     ResultSome,
     ResultOption,
+    Erased,
+    OptionErased,
+    VecErased,
+    AnyBox,
+    AnyArc,
+    OptionAnyBox,
+    OptionAnyArc,
+    ResultAnyBox,
+    ResultAnyArc,
 }
 
 pub fn analyze_return(sig: &syn::Signature) -> RetCase {
@@ -33,6 +42,28 @@ pub fn analyze_return(sig: &syn::Signature) -> RetCase {
                     .last()
                     .map(|s| s.ident.to_string())
                     .unwrap_or_default();
+                if last == "ErasedEvent" {
+                    return RetCase::Erased;
+                }
+                if last == "Vec" {
+                    if let Some(syn::PathArguments::AngleBracketed(ab)) =
+                        tp.path.segments.last().map(|s| &s.arguments)
+                    {
+                        if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_tp))) =
+                            ab.args.first()
+                        {
+                            if inner_tp
+                                .path
+                                .segments
+                                .last()
+                                .map(|s| s.ident == "ErasedEvent")
+                                .unwrap_or(false)
+                            {
+                                return RetCase::VecErased;
+                            }
+                        }
+                    }
+                }
                 if last == "Result" {
                     if let Some(seg) = tp.path.segments.last() {
                         if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
@@ -43,6 +74,24 @@ pub fn analyze_return(sig: &syn::Signature) -> RetCase {
                                     }
                                 }
                                 if let syn::Type::Path(ok_tp) = ok_ty {
+                                    // Result<Box<dyn Any>> / Result<Arc<dyn Any>>
+                                    if let Some(last_ok) = ok_tp.path.segments.last() {
+                                        let lname = last_ok.ident.to_string();
+                                        if lname == "Box" {
+                                            return RetCase::ResultAnyBox;
+                                        } else if lname == "Arc" {
+                                            return RetCase::ResultAnyArc;
+                                        }
+                                    }
+                                    if ok_tp
+                                        .path
+                                        .segments
+                                        .last()
+                                        .map(|s| s.ident == "ErasedEvent")
+                                        .unwrap_or(false)
+                                    {
+                                        return RetCase::Erased; // treat Result<ErasedEvent, _> as Erased side-effect publish
+                                    }
                                     if ok_tp
                                         .path
                                         .segments
@@ -60,8 +109,39 @@ pub fn analyze_return(sig: &syn::Signature) -> RetCase {
                     }
                     RetCase::ResultUnit
                 } else if last == "Option" {
+                    if let Some(syn::PathArguments::AngleBracketed(ab)) =
+                        tp.path.segments.last().map(|s| &s.arguments)
+                    {
+                        if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_tp))) =
+                            ab.args.first()
+                        {
+                            if let Some(last_inner) = inner_tp.path.segments.last() {
+                                let lname = last_inner.ident.to_string();
+                                if lname == "Box" {
+                                    return RetCase::OptionAnyBox;
+                                } else if lname == "Arc" {
+                                    return RetCase::OptionAnyArc;
+                                }
+                            }
+                            if inner_tp
+                                .path
+                                .segments
+                                .last()
+                                .map(|s| s.ident == "ErasedEvent")
+                                .unwrap_or(false)
+                            {
+                                return RetCase::OptionErased;
+                            }
+                        }
+                    }
                     RetCase::OptionSome
                 } else {
+                    if last == "Box" {
+                        return RetCase::AnyBox;
+                    }
+                    if last == "Arc" {
+                        return RetCase::AnyArc;
+                    }
                     RetCase::Some
                 }
             }
